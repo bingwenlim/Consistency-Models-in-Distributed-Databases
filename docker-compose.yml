@@ -1,0 +1,72 @@
+services:
+  mongo1:
+    image: mongo:7.0
+    container_name: mongo1
+    hostname: mongo1
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27017:27017"
+    networks:
+      - mongo-cluster
+    volumes:
+      - mongo1-data:/data/db
+
+  mongo2:
+    image: mongo:7.0
+    container_name: mongo2
+    hostname: mongo2
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27018:27017"
+    networks:
+      - mongo-cluster
+    volumes:
+      - mongo2-data:/data/db
+
+  mongo3:
+    image: mongo:7.0
+    container_name: mongo3
+    hostname: mongo3
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27019:27017"
+    networks:
+      - mongo-cluster
+    volumes:
+      - mongo3-data:/data/db
+
+  mongo4:
+    image: mongo:7.0
+    container_name: mongo4
+    hostname: mongo4
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27020:27017"
+    networks:
+      - mongo-cluster
+    volumes:
+      - mongo4-data:/data/db
+
+  mongo5:
+    image: mongo:7.0
+    container_name: mongo5
+    hostname: mongo5
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--port", "27017"]
+    ports:
+      - "27021:27017"
+    networks:
+      - mongo-cluster
+    volumes:
+      - mongo5-data:/data/db
+
+networks:
+  mongo-cluster:
+    name: mongo-cluster
+    driver: bridge
+
+volumes:
+  mongo1-data:
+  mongo2-data:
+  mongo3-data:
+  mongo4-data:
+  mongo5-data:
