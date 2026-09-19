@@ -1,0 +1,11 @@
+[project]
+name = "consistency-experiments"
+version = "0.1.0"
+description = "Client-centric consistency experiments against a 5-node MongoDB replica set"
+requires-python = ">=3.11"
+dependencies = [
+    "pymongo>=4.9",
+]
+
+[tool.uv]
+package = false
