@@ -173,8 +173,11 @@ def writes_follow_reads(read_concern: str, write_concern, config_label: str) -> 
     print(f"  survived heal:       k1={final1}  k2={final2}")
     if w2_acked and saw == 1 and final2 == 1 and final1 != 1:
         print("  verdict:             VIOLATED (W2 followed a read of k1=1 that rolled back)")
-    elif read_blocked or not dependent:
-        print("  verdict:             SAFE (doomed read was UNAVAILABLE — no dependent write)")
+    elif read_blocked:
+        print("  verdict:             SAFE (majority read was UNAVAILABLE — no dependent write)")
+    elif not dependent:
+        print("  verdict:             SAFE (majority read returned committed data, not the "
+              "doomed value — no dependent write)")
     elif final1 == 1:
         print("  verdict:             HELD (the read value survived)")
     else:

@@ -62,25 +62,57 @@ a rollback that removes W1 but not W2 — and read both keys from the survivor.
 
 | readConcern | writeConcern | predicted | observed |
 |---|---|---|---|
-| majority | majority | HOLDS | <!-- SAFE --> |
-| local | majority | HOLDS | <!-- SAFE --> |
-| majority | w:1 | VIOLATED | <!-- VIOLATED --> |
-| local | w:1 | VIOLATED | <!-- VIOLATED --> |
+| majority | majority | HOLDS | **SAFE** ✓ |
+| local | majority | HOLDS | **SAFE** ✓ |
+| majority | w:1 | VIOLATED | **VIOLATED** ✓ |
+| local | w:1 | VIOLATED | **VIOLATED** ✓ |
 
-### VIOLATED — `majority/w:1` (and identically `local/w:1`)
-```
-<!-- PASTE: run.sh monotonic-writes majority/w:1 -->
-```
+All four observations match the prediction.
 
-### SAFE — `majority/majority` (and identically `local/majority`)
+### VIOLATED — `majority/w:1` (identical result for `local/w:1`)
 ```
-<!-- PASTE: run.sh monotonic-writes majority/majority -->
+==> baseline written: mw-k1=0, mw-k2=0 (durable)
+==> partitioning ['mongo1', 'mongo2'] (minority) from the majority side
+==> W1: mw-k1=1 w:1 ACKED on mongo1 (doomed)
+==> waiting up to 40s for mongo3 to become primary
+==> W2: mw-k2=1 w:1 ACKED on mongo3 (survives)
+==> healing partition
+=== Monotonic-writes / rollback ===
+  config:              majority/w:1
+  W1 acknowledged:     True   (k1)
+  W2 acknowledged:     True   (k2)
+  survived heal:       k1=0  k2=1
+  verdict:             VIOLATED (W2 visible, W1 rolled back)
 ```
+W1 (k1=1) was acknowledged on the doomed old primary and W2 (k2=1) on the new
+primary. After the heal, k2=1 survives but k1=1 is gone — the later write is
+visible without the earlier one.
+
+### SAFE — `majority/majority` (identical result for `local/majority`)
+```
+==> baseline written: mw-k1=0, mw-k2=0 (durable)
+==> partitioning ['mongo1', 'mongo2'] (minority) from the majority side
+==> W1: mw-k1=1 majority REFUSED on mongo1: ...timed out...
+==> waiting up to 40s for mongo3 to become primary
+==> W2: mw-k2=1 majority ACKED on mongo3 (survives)
+==> healing partition
+=== Monotonic-writes / rollback ===
+  config:              majority/majority
+  W1 acknowledged:     False   (k1)
+  W2 acknowledged:     True   (k2)
+  survived heal:       k1=0  k2=1
+  verdict:             SAFE (W1 refused — never falsely acknowledged)
+```
+The `w:majority` W1 could not reach a majority on the minority side, so it was
+never acknowledged. There is no acknowledged earlier write to lose, so the
+ordering cannot be broken.
 
 ## 5. Expectations vs. observations, and limitations
 
-**Agreement.** <!-- fill after runs: observations match the prediction; MW holds
-iff writeConcern=majority. -->
+**Agreement.** All four observations match the prediction exactly. MW holds iff
+`writeConcern:majority`; `readConcern` has no effect on it. The two `w:1` configs
+both fail by the same rollback, and both `majority` configs are safe because the
+minority-side write is refused rather than falsely acknowledged.
 
 **Limitations.**
 - The violation depends on the failover window (W1 acked on the old primary
