@@ -23,6 +23,31 @@ until [ "$(docker exec mongo1 mongosh --quiet --eval 'rs.isMaster().primary ? "y
   sleep 1
 done
 
+echo "==> Ensuring mongo1 is PRIMARY..."
+# mongo1 has the highest priority so it should win, but election timing on a
+# fresh set can briefly seat another node. If mongo1 isn't primary, step down
+# whoever is; mongo1's priority then wins the re-election.
+for _ in $(seq 1 15); do
+  PRIMARY="$(docker exec mongo1 mongosh --quiet --eval 'rs.isMaster().primary' 2>/dev/null)"
+  if [ "$PRIMARY" = "mongo1:27017" ]; then
+    break
+  fi
+  echo "    Current PRIMARY is ${PRIMARY:-none}; stepping it down to favor mongo1..."
+  # Find the current primary's container name from its host:port and step it down.
+  CUR="$(echo "$PRIMARY" | cut -d: -f1)"
+  if [ -n "$CUR" ]; then
+    docker exec "$CUR" mongosh --quiet --eval 'try { rs.stepDown(60) } catch (e) {}' >/dev/null 2>&1 || true
+  fi
+  sleep 3
+done
+
+FINAL_PRIMARY="$(docker exec mongo1 mongosh --quiet --eval 'rs.isMaster().primary' 2>/dev/null)"
+if [ "$FINAL_PRIMARY" != "mongo1:27017" ]; then
+  echo "    WARNING: mongo1 is not PRIMARY (current: ${FINAL_PRIMARY:-none}). Continuing anyway."
+else
+  echo "    mongo1 is PRIMARY."
+fi
+
 echo "==> Cluster is up. Status:"
 docker exec mongo1 mongosh --quiet --eval 'rs.status().members.forEach(m => print(m.name + " -> " + m.stateStr))'
 
