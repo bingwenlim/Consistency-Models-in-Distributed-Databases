@@ -33,6 +33,22 @@ experiments/
 scripts/                    up/down/status/partition-split/heal-split/rs-init
 ```
 
+## Monotonic-writes: the 4 configs and mechanisms (writeConcern is the culprit)
+| readConcern | writeConcern | verdict | mechanism |
+|---|---|---|---|
+| majority | majority | SAFE | W1 refused on the minority side (never acked) |
+| local | majority | SAFE | same — readConcern does not matter for MW |
+| majority | w:1 | VIOLATED | W1 acked on old primary, rolled back; W2 survives on new primary |
+| local | w:1 | VIOLATED | same rollback |
+
+## Writes-follow-reads: the 4 configs and mechanisms (readConcern is the culprit)
+| readConcern | writeConcern | verdict | mechanism |
+|---|---|---|---|
+| majority | majority | SAFE | doomed read is UNAVAILABLE → no dependent write |
+| majority | w:1 | SAFE | same — writeConcern does not matter for WFR |
+| local | w:1 | VIOLATED | reads doomed k1, then writes surviving k2 |
+| local | majority | VIOLATED | same doomed read |
+
 ## Read-your-writes: the 4 configs and mechanisms
 | readConcern | writeConcern | verdict | mechanism |
 |---|---|---|---|
@@ -45,7 +61,10 @@ scripts/                    up/down/status/partition-split/heal-split/rs-init
 - DONE: rollback mechanism (majority/w:1, local/w:1 → VIOLATED; majority/majority → SAFE). Verified.
 - DONE: divergent_read (local/majority → VIOLATED; majority-read control → UNAVAILABLE). Verified.
 - DONE: refactored into models/read_your_writes.py with shared lib.py helpers; single run.sh; report at reports/read-your-writes.md.
-- PENDING: other 3 models (monotonic reads, monotonic writes, writes-follow-reads).
+- DONE: monotonic-writes (models/monotonic_writes.py) — rollback mechanism, writeConcern is the culprit; report at reports/monotonic-writes.md.
+- DONE: writes-follow-reads (models/writes_follow_reads.py) — doomed-read mechanism, readConcern is the culprit; report at reports/writes-follow-reads.md.
+- ENHANCED: experiments/trials.sh runs each config N times and reports a verdict distribution (violation rate), not a single anecdote.
+- PENDING: monotonic-reads (the remaining model).
 
 ## Fault mechanisms (real events only, no failpoints)
 - Rollback: partition puts old primary on minority side; w:1 write acks there and is

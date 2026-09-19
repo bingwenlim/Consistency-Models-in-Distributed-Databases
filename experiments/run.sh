@@ -54,9 +54,17 @@ case "$MODEL" in
     ensure_mongo1_primary
     uv run "$HERE/models/read_your_writes.py" --config "$@"
     ;;
+  monotonic-writes|mw)
+    ensure_mongo1_primary
+    uv run "$HERE/models/monotonic_writes.py" --config "$@"
+    ;;
+  writes-follow-reads|wfr)
+    ensure_mongo1_primary
+    uv run "$HERE/models/writes_follow_reads.py" --config "$@"
+    ;;
   *)
     echo "Unknown model: $MODEL" >&2
-    echo "Available: read-your-writes" >&2
+    echo "Available: read-your-writes, monotonic-writes, writes-follow-reads" >&2
     exit 1
     ;;
 esac

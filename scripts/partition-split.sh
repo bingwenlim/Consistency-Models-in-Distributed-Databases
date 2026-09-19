@@ -18,6 +18,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Run a command in a container's network namespace, bounded by a timeout so a
+# wedged Docker sidecar fails fast instead of hanging the whole experiment.
+# Uses a plain `docker run` sidecar (the mongo image has no iptables) and a
+# portable timeout (macOS has no coreutils `timeout`).
+NETNS_TIMEOUT="${NETNS_TIMEOUT:-20}"
+run_netns() {  # run_netns <container> <cmd...>
+  local host="$1"; shift
+  perl -e 'alarm shift; exec @ARGV or exit 127' "$NETNS_TIMEOUT" \
+    docker run --rm --net "container:${host}" --cap-add NET_ADMIN \
+    nicolaka/netshoot "$@" >/dev/null 2>&1 || return $?
+}
+
 GROUP_A=("$@")
 if [ ${#GROUP_A[@]} -eq 0 ]; then
   GROUP_A=(mongo1 mongo2)
@@ -45,10 +57,8 @@ echo "    Group B (majority / new primary): ${GROUP_B[*]}"
 # For every node in A, drop traffic to/from every node in B (and vice versa).
 block_pair() {
   local host="$1" peerip="$2"
-  docker run --rm --net "container:${host}" --cap-add NET_ADMIN nicolaka/netshoot \
-    iptables -A INPUT  -s "$peerip" -j DROP >/dev/null 2>&1 || true
-  docker run --rm --net "container:${host}" --cap-add NET_ADMIN nicolaka/netshoot \
-    iptables -A OUTPUT -d "$peerip" -j DROP >/dev/null 2>&1 || true
+  run_netns "$host" iptables -A INPUT  -s "$peerip" -j DROP || true
+  run_netns "$host" iptables -A OUTPUT -d "$peerip" -j DROP || true
 }
 
 for a in "${GROUP_A[@]}"; do
