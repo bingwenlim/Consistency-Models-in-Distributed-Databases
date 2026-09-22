@@ -3,14 +3,16 @@
 #
 # Usage:
 #   ./run.sh read-your-writes <config> [--control]
+#   ./run.sh monotonic-reads <config>
+#   ./run.sh monotonic-writes <config>
+#   ./run.sh writes-follow-reads <config>
 #     configs: majority/majority | majority/w:1 | local/w:1 | local/majority
 #     --control  (local/majority only) run the majority-read control -> UNAVAILABLE
 #
 # Ensures mongo1 is PRIMARY first, then runs the model. ALWAYS heals the partition
 # and restores electionTimeoutMillis=10000 on exit (even on failure / Ctrl-C).
 #
-# More models (monotonic-reads, monotonic-writes, writes-follow-reads) slot in as
-# experiments/models/<name>.py and a case below.
+# Each model has a script in experiments/models/.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,9 +56,21 @@ case "$MODEL" in
     ensure_mongo1_primary
     uv run "$HERE/models/read_your_writes.py" --config "$@"
     ;;
+  monotonic-reads|mr)
+    ensure_mongo1_primary
+    uv run "$HERE/models/monotonic_reads.py" --config "$@"
+    ;;
+  monotonic-writes|mw)
+    ensure_mongo1_primary
+    uv run "$HERE/models/monotonic_writes.py" --config "$@"
+    ;;
+  writes-follow-reads|wfr)
+    ensure_mongo1_primary
+    uv run "$HERE/models/writes_follow_reads.py" --config "$@"
+    ;;
   *)
     echo "Unknown model: $MODEL" >&2
-    echo "Available: read-your-writes" >&2
+    echo "Available: read-your-writes, monotonic-reads, monotonic-writes, writes-follow-reads" >&2
     exit 1
     ;;
 esac
