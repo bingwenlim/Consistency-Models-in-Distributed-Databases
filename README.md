@@ -1,173 +1,155 @@
-# Consistency Models in Distributed Databases — MongoDB
+# Consistency Models in Distributed Databases
 
-A 5-node MongoDB replica set running in Docker, used to experiment with
-**client-centric consistency**: read-your-writes, monotonic-reads,
-monotonic-writes, and writes-follow-reads.
+A laboratory study of MongoDB's causal consistency guarantees through controlled network partitions and replica set failovers.
 
-Each model is tested across the four `readConcern` × `writeConcern` configs, using
-**only real events** — network partitions and real writes. No failpoints, no
-modifications to MongoDB.
+## Quick Start
 
----
+### Prerequisites
 
-## 1. Prerequisites
+- Docker and Docker Compose
+- Python ≥ 3.11
+- `uv` package manager
 
-- **Docker Desktop** installed and **running** (`docker info` should print without error).
-- **uv** (Python package manager) for running the experiment scripts: `brew install uv`.
-- **mongosh** — optional; you can use the copy *inside* the containers instead.
-
-Everything below assumes you're in the project root:
-```bash
-cd ~/Consistency-Models-in-Distributed-Databases
-```
-
----
-
-## 2. What's in here
-
-```
-docker-compose.yml            5 mongod containers (mongo:7.0) on one Docker network
-scripts/
-  rs-init.js                  replica-set config (mongo1 priority 2 = primary, mongo3 = failover)
-  up.sh                       start containers + init replica set + force mongo1 PRIMARY
-  down.sh [--wipe]            stop the cluster (--wipe also deletes data)
-  status.sh                   show who is PRIMARY / SECONDARY and replication lag
-  partition-split.sh [nodes]  TRUE two-sided partition (default: mongo1+mongo2 | mongo3+4+5)
-  heal-split.sh               remove the partition; nodes re-sync
-experiments/
-  lib.py                      shared helpers (connections, partition/reconfig, state print)
-  models/read_your_writes.py  read-your-writes across all 4 configs
-  run.sh                      entrypoint: ./run.sh read-your-writes <config> [--control]
-  reports/read-your-writes.md steps + captured results for RYOW
-```
-
-**Node → host port map** (target a *specific* node from your host):
-
-| Node   | Host port |
-|--------|-----------|
-| mongo1 | 27017     |
-| mongo2 | 27018     |
-| mongo3 | 27019     |
-| mongo4 | 27020     |
-| mongo5 | 27021     |
-
-**Topology.** Priorities are `mongo1=2` (always PRIMARY), `mongo3=1` (the designated
-failover), `mongo2/4/5=0` (never elected). So when the cluster is split into
-`mongo1+mongo2` (minority, led by the old primary) vs `mongo3+mongo4+mongo5`
-(majority), mongo3 deterministically wins the majority side.
-
----
-
-## 3. Start the cluster
+### Start the Cluster
 
 ```bash
 ./scripts/up.sh
 ```
 
-Pulls `mongo:7.0` (first run only), starts all 5 containers, initializes replica set
-`rs0`, and forces mongo1 to PRIMARY. Check state at any time:
+This brings up the 5-node MongoDB replica set and initializes it with the correct priorities. The script waits for mongo1 to become PRIMARY before returning.
+
+### Run Experiments
+
+From the `experiments` directory:
+
 ```bash
-./scripts/status.sh      # expect 1 PRIMARY + 4 SECONDARY, all health=1
+cd experiments
+```
+
+**Run a single test:**
+```bash
+uv run models/read_your_writes.py --config majority/majority
+```
+
+**Run all 4 configs for one model:**
+```bash
+uv run run_experiments.py --model monotonic_reads
+```
+
+**Run all 16 tests (all 4 models × 4 configs):**
+```bash
+uv run run_experiments.py
+```
+
+**Expected runtimes:**
+- Single test: 90–210 seconds (depending on mechanism)
+- One model (4 tests): 300–600 seconds
+- All 16 tests: ~30 minutes
+
+### Stop the Cluster
+
+```bash
+./scripts/down.sh
+```
+
+To also wipe all data:
+```bash
+./scripts/down.sh --wipe
 ```
 
 ---
 
-## 4. Connect and interact
+## Project Structure
 
-The experiment client connects to **one specific node by its host port** with
-`directConnection=true` — a `replicaSet=rs0` URI is not usable from the host because
-the driver would try to reach members by their container hostnames (`mongo1:27017`,
-…), which don't resolve outside the Docker network.
-
-```bash
-mongosh "mongodb://localhost:27019/?directConnection=true"   # talk to mongo3 directly
+```
+.
+├── docker-compose.yml              # 5-node MongoDB cluster definition
+├── scripts/
+│   ├── up.sh                       # Start and initialize cluster
+│   ├── down.sh                     # Stop cluster
+│   ├── rs-init.js                  # Replica set configuration
+│   ├── partition-split.sh          # Create network partition
+│   ├── heal-split.sh               # Heal network partition
+│   └── ...
+├── experiments/
+│   ├── lib.py                      # Shared cluster utilities
+│   ├── helpers.py                  # Common test helpers
+│   ├── run_experiments.py          # Test orchestration harness
+│   ├── models/
+│   │   ├── read_your_writes.py
+│   │   ├── monotonic_reads.py
+│   │   ├── monotonic_writes.py
+│   │   └── writes_follow_reads.py
+│   └── pyproject.toml              # Python dependencies
+├── report.md                        # Detailed experimental report
+└── README.md                        # This file
 ```
 
-Or use the mongosh inside a container:
+---
+
+## Cluster Topology
+
+The cluster consists of 5 MongoDB nodes with the following replica set priorities:
+
+- **mongo1** (port 27017): priority=2 (designated PRIMARY)
+- **mongo2** (port 27018): priority=0 (SECONDARY)
+- **mongo3** (port 27019): priority=1 (failover PRIMARY)
+- **mongo4** (port 27020): priority=0 (SECONDARY)
+- **mongo5** (port 27021): priority=0 (SECONDARY)
+
+This configuration ensures that after a partition isolating mongo1 and mongo2, mongo3 becomes the PRIMARY of the majority side. See `report.md` Section I for detailed explanation.
+
+---
+
+## Experiment Overview
+
+Four consistency models are tested across four read concern / write concern combinations:
+
+1. **Read-Your-Writes (RYOW):** After a session writes, later reads in that session see the write or newer.
+2. **Monotonic-Reads (MR):** Once a session reads a value, later reads do not return older state.
+3. **Monotonic-Writes (MW):** Session writes appear in order everywhere; later writes never appear without earlier ones.
+4. **Writes-Follow-Reads (WFR):** A write issued after reading a value is ordered after that value.
+
+Configurations tested:
+- `majority/majority`
+- `majority/w:1`
+- `local/w:1`
+- `local/majority`
+
+See `report.md` for detailed explanation of the setup, mechanisms, and results.
+
+---
+
+## Understanding the Results
+
+Each test outputs a verdict and explanation. Verdicts are:
+
+- **SAFE:** The consistency guarantee held.
+- **VIOLATED:** The consistency guarantee was broken.
+- **HELD:** Writes/reads remained consistent.
+- **UNAVAILABLE:** The operation timed out or was unreachable (often correct behavior for majority reads on isolated partitions).
+- **INCONCLUSIVE:** Timing or other factors prevented a conclusive result; re-run the test.
+
+---
+
+## Connection Details
+
+To connect to a specific node from your host:
+
+```bash
+mongosh "mongodb://localhost:27017/?directConnection=true"   # mongo1
+mongosh "mongodb://localhost:27019/?directConnection=true"   # mongo3
+```
+
+Or use mongosh inside a container:
+
 ```bash
 docker exec -it mongo1 mongosh
 ```
 
 ---
 
-## 5. The consistency knobs
-
-The experiment varies **two** knobs; the other two are fixed by protocol.
-
-| Knob | Role | Values |
-|------|------|--------|
-| **writeConcern** `w` | **swept** | `1`, `"majority"` |
-| **readConcern** | **swept** | `"local"`, `"majority"` |
-| **Causal session** | **always ON** | the client-centric guarantees are *defined over* a causally consistent session |
-| **readPreference / target node** | **chosen per experiment** | picks which node serves the read so it can lag or diverge |
-
-**Why the causal session is always on.** The four client-centric guarantees only
-apply *inside* a causally consistent session — it carries the write's operation time
-(`afterClusterTime`) into the next read so the read can wait for that timestamp. With
-the session off you'd be measuring raw replication luck, not the guarantee. We leave
-it on for every trial and show that even so, 3 of the 4 configs still fail.
-
-**Why the target node is a per-experiment choice.** It decides which node serves the
-read. If reads always hit the primary, RYOW holds trivially. Each experiment
-deliberately points the read at a node that may not have the write (a stale ex-primary
-on the losing side of a partition). It is a lever, not a swept variable.
-
----
-
-## 6. Running the experiments
-
-```bash
-./run.sh read-your-writes majority/majority     # SAFE   (write refused on minority)
-./run.sh read-your-writes majority/w:1           # VIOLATED (rollback)
-./run.sh read-your-writes local/w:1              # VIOLATED (rollback)
-./run.sh read-your-writes local/majority         # VIOLATED (divergent read)
-./run.sh read-your-writes local/majority --control  # UNAVAILABLE (majority-read control)
-```
-(run from the `experiments/` directory). `run.sh` forces mongo1 PRIMARY first, and
-**always** heals the partition and restores `electionTimeoutMillis`/priorities on exit,
-even on Ctrl-C. Full steps and captured output: [`experiments/reports/read-your-writes.md`](experiments/reports/read-your-writes.md).
-
-The other three models (monotonic-reads, monotonic-writes, writes-follow-reads) slot
-in as `experiments/models/<name>.py` plus a case in `run.sh`.
-
----
-
-## 7. Faults: the network partition
-
-`partition-split.sh` creates a **true two-sided partition** by injecting `iptables`
-DROP rules into each container's network namespace (via a privileged helper container
-sharing that netns). It blocks traffic **only between the two groups**; every node
-stays reachable from the host, so the experiment client can still read any node by its
-port. `heal-split.sh` flushes the rules and the nodes re-sync (un-replicated writes on
-the minority side roll back).
-
-```bash
-./scripts/partition-split.sh            # default: mongo1+mongo2 | mongo3+mongo4+mongo5
-./scripts/heal-split.sh
-```
-
-- Partition **2 nodes** off → the other 3 keep majority → the majority side stays
-  writable and elects mongo3; the minority side becomes read-only.
-- Partition the **current primary** onto the minority → after `electionTimeoutMillis`
-  it steps down and mongo3 is elected on the majority side.
-
-> **Safety vs. liveness.** A read that *blocks/times out*, or a majority write that is
-> *refused*, is **consistent but unavailable** — the system declined to return or
-> confirm a wrong value (score as UNAVAILABLE / SAFE, not a failure). A read that
-> returns a *stale or absent* value is a genuine consistency **VIOLATION**.
-
----
-
-## 8. Shut down
-
-```bash
-./scripts/down.sh          # stop containers, KEEP data
-./scripts/down.sh --wipe   # stop AND delete all data for a clean slate
-```
-
----
-
-## 9. Troubleshooting
+## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
@@ -176,13 +158,11 @@ the minority side roll back).
 | Partition helper errors | First run pulls the `nicolaka/netshoot` image; ensure Docker has network access. |
 | `local/majority` returns INCONCLUSIVE | Timing-window dependent (~90% reliable). Re-run; see the report's limitations. |
 | Port already in use | Something else holds 27017–27021. Stop it, or edit the port mappings in `docker-compose.yml`. |
-| Node stuck unreachable after heal | Wait for re-sync, or check you healed the right node name; `status.sh` shows current state. |
 
 ---
 
-## 10. Optional: GUI inspection
+## References
 
-MongoDB Compass (free) can connect to a single node with
-`mongodb://localhost:27017/?directConnection=true` to browse data and view topology.
-Handy for eyeballing state — but run the timed consistency experiments from the
-CLI, where you control ordering precisely.
+- MongoDB Manual: [Causal Consistency](https://docs.mongodb.com/manual/core/read-isolation-consistency-semantics/#causal-consistency)
+- Terry et al. (1994): "Session Guarantees for Weakly Consistent Replicated Data"
+

@@ -37,6 +37,16 @@ MINORITY_SECONDARY = "mongo2" # rides with mongo1 on the minority side
 MINORITY = ["mongo1", "mongo2"]
 
 
+def run_script(name: str, *args: str) -> None:
+    """Run a shell script from the scripts/ directory, passing through any args.
+
+    Raises CalledProcessError if the script exits non-zero -- partition/heal must
+    actually take effect for a trial to be meaningful, so failures are not silent.
+    """
+    script = SCRIPTS / name
+    subprocess.run([str(script), *args], check=True)
+
+
 def direct(node: str, socket_ms: int = 5000) -> MongoClient:
     """Direct connection to one node by name (bypasses replica-set discovery)."""
     return MongoClient(
@@ -44,11 +54,6 @@ def direct(node: str, socket_ms: int = 5000) -> MongoClient:
         serverSelectionTimeoutMS=3000,
         socketTimeoutMS=socket_ms,
     )
-
-
-def run_script(script: str, *args: str) -> None:
-    subprocess.run([str(SCRIPTS / script), *args], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def partition_minority() -> None:
@@ -63,6 +68,7 @@ def set_election_timeout(ms: int) -> None:
     """Set electionTimeoutMillis via one rs.reconfig. Tries each node so whoever
     is primary accepts it. Priority is left at baseline -- raising it does NOT
     speed elections (the full electionTimeoutMillis elapses before any vote).
+    Default is 5000ms for fast elections; divergent-read tests override to 120000ms.
     """
     js = f"const c=rs.conf(); c.settings.electionTimeoutMillis={ms}; rs.reconfig(c);"
     for node in NODES:

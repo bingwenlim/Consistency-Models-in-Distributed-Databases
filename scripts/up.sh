@@ -51,6 +51,9 @@ fi
 echo "==> Cluster is up. Status:"
 docker exec mongo1 mongosh --quiet --eval 'rs.status().members.forEach(m => print(m.name + " -> " + m.stateStr))'
 
+echo "==> Setting electionTimeoutMillis to 5000ms for faster elections..."
+docker exec mongo1 mongosh --quiet --eval 'const c=rs.conf(); c.settings.electionTimeoutMillis=5000; rs.reconfig(c)' >/dev/null 2>&1 || true
+
 cat <<'EOF'
 
 Connect from your host with:

@@ -1,8 +1,17 @@
-"""Test monotonic reads across four read/write concern combinations.
+"""Monotonic-reads (MR) across all four readConcern x writeConcern configs.
 
-The first read observes X=1 on the new primary's side of a partition. The
-second read targets a secondary on the old primary's side. A separate session
-on the second MongoClient inherits the first session's causal timestamps.
+MR: within a session, a read never returns an older value than an earlier read.
+If Read 1 sees X=1, no later read in that session may return X=0.
+
+Mechanism: divergent-read. Read 1 sees X=1 on the failover primary. Read 2,
+carrying Read 1's causal tokens, targets a minority secondary whose clock has
+been advanced past T1 but which never received X=1.
+
+Expected verdicts:
+  majority/majority -> NOT_VIOLATED  (majority read on minority times out, no stale data)
+  majority/w:1      -> NOT_VIOLATED  (majority read on minority times out, no stale data)
+  local/majority    -> VIOLATED      (local read gates on clock, returns X=0)
+  local/w:1         -> VIOLATED      (local read gates on clock, returns X=0)
 """
 
 from __future__ import annotations
@@ -19,24 +28,18 @@ from pymongo.write_concern import WriteConcern
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib import (  # noqa: E402
-    DB,
-    FAILOVER,
-    MINORITY_SECONDARY,
-    OLD_PRIMARY,
-    direct,
-    heal,
-    partition_minority,
-    set_election_timeout,
-    wait_primary,
+    DB, OLD_PRIMARY, FAILOVER, MINORITY_SECONDARY,
+    direct, partition_minority, set_election_timeout, wait_primary,
 )
-
+from helpers import finalize_experiment
 
 CONFIGS = {
     "majority/majority": ("majority", "majority"),
     "majority/w:1": ("majority", 1),
-    "local/majority": ("local", "majority"),
     "local/w:1": ("local", 1),
+    "local/majority": ("local", "majority"),
 }
+
 ELECTION_TIMEOUT_MS = 120000
 NEW_PRIMARY_WAIT_SECONDS = 175
 READ_TIMEOUT_MS = 6000
@@ -63,6 +66,7 @@ def wait_for_value(node: str, collection: str, key: str, value: int, seconds: in
 
 
 def check_election_timeout(expected_ms: int) -> None:
+    """Verify the replica set's election timeout is set to the expected value."""
     with direct(OLD_PRIMARY) as client:
         config = client.admin.command("replSetGetConfig")["config"]
     actual = config.get("settings", {}).get("electionTimeoutMillis", 10000)
@@ -70,8 +74,8 @@ def check_election_timeout(expected_ms: int) -> None:
         raise Inconclusive(f"electionTimeoutMillis is {actual}, expected {expected_ms}")
 
 
-def run(config: str) -> str:
-    read_concern, write_concern = CONFIGS[config]
+def monotonic_reads(read_concern: str, write_concern, config_label: str) -> str:
+    """Divergent-read mechanism: Read 1 sees X=1 on failover, Read 2 targets stale minority."""
     key = f"mr-{uuid4().hex}"
     tick_key = f"mr-tick-{uuid4().hex}"
     verdict = "INCONCLUSIVE"
@@ -155,33 +159,37 @@ def run(config: str) -> str:
                         verdict = "VIOLATED"
                         detail = "Read 2 returned X=0 after Read 1 returned X=1"
                     elif second_value == 1:
-                        verdict = "HELD"
-                        detail = "both completed reads returned X=1"
+                        verdict = "NOT_VIOLATED"
+                        detail = "Read 2 returned X=1"
                     else:
                         raise Inconclusive(f"Read 2 returned unexpected value {second_value}")
                 except ExecutionTimeout:
-                    verdict = "UNAVAILABLE"
-                    detail = "Read 2 timed out without returning an older value"
+                    verdict = "NOT_VIOLATED"
+                    detail = "Read 2 timed out rather than returning stale data"
+
     except Inconclusive as exc:
         detail = str(exc)
     except (PyMongoError, OSError) as exc:
-        detail = f"{type(exc).__name__}: {exc}"
+        detail = f"{type(exc).__name__}: {str(exc)[:60]}"
     finally:
-        print("==> healing partition and restoring election timeout", flush=True)
-        heal()
-        time.sleep(10)
-        set_election_timeout(10000)
+        finalize_experiment()
 
-    print("\n=== Monotonic reads ===")
-    print(f"  config:   {config}")
+    print()
+    print(f"=== MR / divergent-read ===")
+    print(f"  config:   {config_label}")
     print(f"  verdict:  {verdict} ({detail})\n")
     return verdict
 
 
+def run(config: str) -> str:
+    read_concern, write_concern = CONFIGS[config]
+    return monotonic_reads(read_concern, write_concern, config)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Monotonic-reads experiment")
-    parser.add_argument("--config", required=True, choices=CONFIGS)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Monotonic-reads experiment")
+    ap.add_argument("--config", required=True, choices=CONFIGS, help="readConcern/writeConcern")
+    args = ap.parse_args()
     if run(args.config) == "INCONCLUSIVE":
         raise SystemExit(2)
 
