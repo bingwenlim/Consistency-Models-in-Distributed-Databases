@@ -18,11 +18,22 @@ The choice of five nodes with asymmetric priorities serves two purposes. First, 
 
 **heal()** reverses the partition by flushing all iptables rules. When connectivity is restored, MongoDB detects that the cluster is whole again and begins reconciling the two divergent histories. Crucially, MongoDB always trusts the majority partition's history as canonical. Any writes that were acknowledged on the isolated minority but never replicated to the majority are discarded—they roll back. This behavior is essential to understanding how writes with different write concerns (w:1 vs. w:majority) survive or fail network failures.
 
-**set_election_timeout(ms)** reconfigures the replica set's `electionTimeoutMillis` parameter, which controls how long a node waits before triggering an election when it cannot reach the current primary. The choice of this parameter is crucial for divergent-read tests and deserves empirical justification.
+**set_election_timeout(ms)** reconfigures the replica set's `electionTimeoutMillis` parameter, which controls how long a node waits before triggering an election when it cannot reach the current primary. This parameter directly affects the timing dynamics during a network partition, particularly the window between when mongo3 (majority side) becomes PRIMARY and when mongo1 (minority side) steps down.
 
-We measured the election timing at six different timeout values. At 5,000 milliseconds (the default), mongo3 becomes PRIMARY and mongo1 steps down at nearly the same moment (+56 seconds after partition), with a window of 0 seconds between them. At 10,000 milliseconds, the window widens slightly to 6 seconds (mongo3 PRIMARY at +15s, mongo1 stepdown at +21s). As the timeout increases, this window grows significantly: at 30,000 milliseconds the window is 26 seconds, at 60,000 milliseconds it is 53 seconds, and at 120,000 milliseconds it reaches 111 seconds (mongo3 PRIMARY at +130s, mongo1 stepdown at +241s).
+We measured election timing empirically at six different timeout values to understand this window. The pattern is clear: as the election timeout increases, the window widens significantly. The table below shows one representative measurement run:
 
-For divergent-read tests, we need mongo1 to remain the PRIMARY of the minority side long enough to issue a clock-advancing write. The 111-second window at 120,000 milliseconds provides ample time to perform this operation after mongo3 becomes PRIMARY on the majority side. At lower timeouts (5,000–10,000 milliseconds), the window is too narrow or nonexistent; mongo1 steps down before we can reliably issue the clock-advance write, and the test fails to capture the clock-skew failure mode. The trade-off is that these tests run longer (~240 seconds vs. ~60 seconds), but the extended timeout is empirically necessary to make the mechanism observable.
+| electionTimeoutMillis | mongo3 PRIMARY | mongo1 STEPDOWN | Window |
+|---|---|---|---|
+| 5000 | ~56s | ~56s | ~0s |
+| 10000 | ~15s | ~21s | ~6s |
+| 15000 | ~25s | ~31s | ~6s |
+| 30000 | ~36s | ~62s | ~26s |
+| 60000 | ~68s | ~121s | ~53s |
+| 120000 | ~130s | ~241s | ~111s |
+
+(Note: These timings vary between runs depending on system load and container overhead. The values shown represent a typical run; actual measurements may differ by 5–15 seconds.)
+
+For divergent-read tests, we need mongo1 to remain PRIMARY on the isolated minority long enough to issue a clock-advancing write after mongo3 becomes PRIMARY on the majority side. At lower timeouts (5,000–10,000 milliseconds), the window is essentially nonexistent or only a few seconds wide—too narrow to reliably perform the clock-advance operation. At 120,000 milliseconds, the window expands to roughly 100–120 seconds, providing ample time to issue the necessary write. The trade-off is that divergent-read tests run significantly longer (~240 seconds vs. ~60 seconds for rollback tests), but this extended timeout is empirically necessary to make the clock-skew mechanism observable without artificial injection.
 
 **wait_primary(node, timeout_seconds)** polls a node's `admin.command('hello')` response every 2 seconds, checking whether it reports itself as the writable primary. The function returns immediately once the node reports PRIMARY status, rather than waiting a fixed duration. This replaces hardcoded sleeps and ensures that timing-sensitive operations (such as writing W2 in a monotonic-writes test) occur on the actual elected primary, not on some arbitrary node.
 
