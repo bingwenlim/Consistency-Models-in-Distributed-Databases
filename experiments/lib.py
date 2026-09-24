@@ -46,11 +46,6 @@ def direct(node: str, socket_ms: int = 5000) -> MongoClient:
     )
 
 
-def run_script(script: str, *args: str) -> None:
-    subprocess.run([str(SCRIPTS / script), *args], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
 def partition_minority() -> None:
     run_script("partition-split.sh", *MINORITY)
 

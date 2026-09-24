@@ -74,12 +74,6 @@ def stabilize_after_test(timeout_seconds: int = 30) -> None:
         time.sleep(1)
 
 
-def write_baseline(node: str, collection: str, doc: dict) -> None:
-    """Write a baseline document durably (w:majority) to a node."""
-    with direct(node) as client:
-        client[DB].get_collection(collection, write_concern=WriteConcern(w="majority")).insert_one(doc)
-
-
 def finalize_experiment(heal_wait_seconds: int = 12) -> None:
     """Heal partition and restore default election timeout (5s for faster elections)."""
     heal()
