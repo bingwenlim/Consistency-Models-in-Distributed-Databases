@@ -141,7 +141,7 @@ def run_all(model_filter: str = None) -> None:
         model = model_result["model"]
         for r in model_result["results"]:
             total += 1
-            if r["verdict"] in ("VIOLATED", "SAFE", "HELD", "UNAVAILABLE"):
+            if r["verdict"] in ("VIOLATED", "NOT_VIOLATED"):
                 passed += 1
             print(f"  {model:<25} {r['config']:<20} {r['verdict']:<15}")
 

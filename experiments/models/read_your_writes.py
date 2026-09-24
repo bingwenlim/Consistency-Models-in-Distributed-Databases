@@ -7,11 +7,17 @@ Two mechanisms expose RYOW violations:
   - Rollback: w:1 writes ack on isolated minority, then roll back on heal
   - Divergent-read: local reads gate on clock, not data presence
 
+Note: the rollback mechanism tests durable RYOW across recovery, not a literal
+second read in the same live session. The write's session is closed and the
+final check reads the recovered durable state after healing. A write the client
+was told succeeded, then lost on rollback, is the RYOW violation -- consistent
+with defining these experiments over durable causal histories.
+
 Expected verdicts:
-  majority/majority -> SAFE      (write refused on minority)
-  majority/w:1      -> VIOLATED  (write rolls back)
-  local/w:1         -> VIOLATED  (write rolls back)
-  local/majority    -> VIOLATED  (divergent read returns stale data)
+  majority/majority -> NOT_VIOLATED  (write refused on minority)
+  majority/w:1      -> VIOLATED      (write rolls back)
+  local/w:1         -> VIOLATED      (write rolls back)
+  local/majority    -> VIOLATED      (divergent read returns stale data)
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from pymongo import MongoClient
 from pymongo.errors import ExecutionTimeout, PyMongoError
@@ -45,12 +52,32 @@ DIVERGENT_ELECTION_TIMEOUT_MS = 120000
 DIVERGENT_PRIMARY_WAIT = 175
 
 
+class Inconclusive(Exception):
+    pass
+
+
+def wait_for_tick(node: str, tick: str, seconds: int) -> bool:
+    """Wait until a local read on a node sees the clock-advance tick document."""
+    deadline = time.monotonic() + seconds
+    with direct(node) as client:
+        coll = client[DB].get_collection("dummy", read_concern=ReadConcern("local"))
+        while time.monotonic() < deadline:
+            try:
+                if coll.find_one({"tick": tick}, max_time_ms=2000) is not None:
+                    return True
+            except PyMongoError:
+                pass
+            time.sleep(0.5)
+    return False
+
+
 def rollback(write_concern, config_label: str) -> str:
     """Rollback mechanism: w:1 write acks on isolated minority, rolls back on heal."""
     wc_label = "majority" if write_concern == "majority" else f"w:{write_concern}"
-    key = f"ryw-{wc_label}-{int(time.time())}"
+    key = f"ryw-{wc_label}-{uuid4().hex}"
     verdict = "INCONCLUSIVE"
     detail = "trial did not complete"
+    healed = False
 
     try:
         p = direct(OLD_PRIMARY)
@@ -64,7 +91,6 @@ def rollback(write_concern, config_label: str) -> str:
         partition_minority()
 
         acked = False
-        session_saw_write = None
         p = MongoClient(
             f"mongodb://localhost:{NODES[OLD_PRIMARY]}/?directConnection=true",
             serverSelectionTimeoutMS=2000, socketTimeoutMS=3000,
@@ -78,12 +104,6 @@ def rollback(write_concern, config_label: str) -> str:
                     print(f"==> {wc_label} write X=1 ACKED on {OLD_PRIMARY}", flush=True)
                 except PyMongoError as e:
                     print(f"==> {wc_label} write X=1 REFUSED: {str(e)[:60]}", flush=True)
-                if acked:
-                    doc = p[DB].get_collection("ryw", read_concern=ReadConcern("local")).find_one(
-                        {"k": key}, session=s
-                    )
-                    session_saw_write = doc["v"] if doc else None
-                    print(f"==> session read-back: X={session_saw_write}", flush=True)
         finally:
             p.close()
 
@@ -91,7 +111,10 @@ def rollback(write_concern, config_label: str) -> str:
         time.sleep(ROLLBACK_STEPDOWN_WAIT)
         print_state("during partition")
 
+        # Heal before the verdict read: the VIOLATED case depends on the doomed
+        # write having rolled back in the recovered durable state.
         finalize_experiment()
+        healed = True
 
         final = None
         for node in (OLD_PRIMARY, FAILOVER):
@@ -106,18 +129,23 @@ def rollback(write_concern, config_label: str) -> str:
             except PyMongoError:
                 continue
 
-        if acked and session_saw_write == 1 and final != 1:
+        if acked and final != 1:
             verdict = "VIOLATED"
             detail = "write rolled back"
         elif not acked:
-            verdict = "SAFE"
+            verdict = "NOT_VIOLATED"
             detail = "write refused"
         elif final == 1:
-            verdict = "HELD"
+            verdict = "NOT_VIOLATED"
             detail = "write survived"
 
+    except Inconclusive as e:
+        detail = str(e)
     except (PyMongoError, OSError) as e:
         detail = f"{type(e).__name__}: {str(e)[:60]}"
+    finally:
+        if not healed:
+            finalize_experiment()
 
     print()
     print(f"=== RYOW / rollback ===")
@@ -126,9 +154,9 @@ def rollback(write_concern, config_label: str) -> str:
     return verdict
 
 
-def divergent_read(read_concern: str) -> str:
+def divergent_read(read_concern: str, config_label: str) -> str:
     """Divergent-read mechanism: local reads gate on clock, not data presence."""
-    key = f"ryw-div-{int(time.time())}"
+    key = f"ryw-div-{uuid4().hex}"
     verdict = "INCONCLUSIVE"
     detail = "trial did not complete"
 
@@ -149,8 +177,7 @@ def divergent_read(read_concern: str) -> str:
 
         print(f"==> waiting {DIVERGENT_PRIMARY_WAIT}s for {FAILOVER} to become PRIMARY", flush=True)
         if not wait_primary(FAILOVER, DIVERGENT_PRIMARY_WAIT):
-            print(f"==> {FAILOVER} not elected; aborting", flush=True)
-            return "INCONCLUSIVE"
+            raise Inconclusive(f"{FAILOVER} was not elected within the timeout")
 
         op_time = cluster_time = None
         w = direct(FAILOVER)
@@ -163,24 +190,32 @@ def divergent_read(read_concern: str) -> str:
                 cluster_time = ws.cluster_time
                 print(f"==> Write 1: X=1 w:majority ACKED on {FAILOVER}; T1={op_time}", flush=True)
         except PyMongoError as e:
-            print(f"==> Write 1 failed: {str(e)[:60]}", flush=True)
-            return "INCONCLUSIVE"
+            raise Inconclusive(f"Write 1 failed: {str(e)[:60]}")
         finally:
             w.close()
 
+        if op_time is None:
+            raise Inconclusive("Write 1 session has no causal operation time")
+
         time.sleep(1)
+        # An unrelated actor's w:1 write to the minority advances mongo2's clock
+        # past T1 without shipping our data there, exposing the divergent read.
+        tick = uuid4().hex
         d = direct(OLD_PRIMARY, socket_ms=3000)
         try:
             d[DB].get_collection("dummy", write_concern=WriteConcern(w=1)).insert_one(
-                {"tick": int(time.time())}
+                {"tick": tick}
             )
             print(f"==> dummy w:1 to {OLD_PRIMARY} (advances minority clock past T1)", flush=True)
-        except PyMongoError:
-            pass
+        except PyMongoError as e:
+            print(f"==> dummy clock-advance write failed: {str(e)[:60]}", flush=True)
+            raise Inconclusive("clock-advance write to old primary failed")
         finally:
             d.close()
 
-        time.sleep(2)
+        if not wait_for_tick(MINORITY_SECONDARY, tick, 12):
+            raise Inconclusive("clock-advance write did not reach the minority secondary")
+        print(f"==> clock-advance write replicated to {MINORITY_SECONDARY}", flush=True)
 
         r = direct(MINORITY_SECONDARY, socket_ms=12000)
         try:
@@ -196,20 +231,22 @@ def divergent_read(read_concern: str) -> str:
                     val = doc["v"] if doc else None
                     print(f"==> Read 1: {read_concern} read on {MINORITY_SECONDARY}: X={val}", flush=True)
                     if val == 1:
-                        verdict = "HELD"
+                        verdict = "NOT_VIOLATED"
                         detail = "read reflected the write"
                     else:
                         verdict = "VIOLATED"
                         detail = f"read returned stale X={val}"
                 except ExecutionTimeout:
-                    verdict = "UNAVAILABLE"
-                    detail = f"{read_concern} read blocked on minority"
+                    verdict = "NOT_VIOLATED"
+                    detail = f"{read_concern} read timed out rather than returning stale data"
                 except PyMongoError as e:
-                    verdict = "UNAVAILABLE"
-                    detail = f"{read_concern} read blocked [{type(e).__name__}]"
+                    verdict = "INCONCLUSIVE"
+                    detail = f"causal read errored [{type(e).__name__}]: {str(e)[:60]}"
         finally:
             r.close()
 
+    except Inconclusive as e:
+        detail = str(e)
     except (PyMongoError, OSError) as e:
         detail = f"{type(e).__name__}: {str(e)[:60]}"
 
@@ -219,17 +256,17 @@ def divergent_read(read_concern: str) -> str:
 
     print()
     print(f"=== RYOW / divergent-read ===")
-    print(f"  config:   local/{read_concern}")
+    print(f"  config:   {config_label}")
     print(f"  verdict:  {verdict} ({detail})\n")
     return verdict
 
 
 def run(config: str) -> str:
     read_concern, write_concern = CONFIGS[config]
-    if write_concern == "majority":
+    if config == "local/majority":
+        return divergent_read("local", config)
+    elif write_concern == "majority":
         return rollback("majority", config)
-    elif config == "local/majority":
-        return divergent_read("local")
     else:
         return rollback(1, config)
 
@@ -240,9 +277,11 @@ def main() -> None:
     ap.add_argument("--control", action="store_true", help="run divergent-read with majority (control)")
     args = ap.parse_args()
     if args.config == "local/majority" and args.control:
-        divergent_read("majority")
+        result = divergent_read("majority", "local/majority (control)")
     else:
-        run(args.config)
+        result = run(args.config)
+    if result == "INCONCLUSIVE":
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

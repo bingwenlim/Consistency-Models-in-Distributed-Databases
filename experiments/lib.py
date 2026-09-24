@@ -37,6 +37,16 @@ MINORITY_SECONDARY = "mongo2" # rides with mongo1 on the minority side
 MINORITY = ["mongo1", "mongo2"]
 
 
+def run_script(name: str, *args: str) -> None:
+    """Run a shell script from the scripts/ directory, passing through any args.
+
+    Raises CalledProcessError if the script exits non-zero -- partition/heal must
+    actually take effect for a trial to be meaningful, so failures are not silent.
+    """
+    script = SCRIPTS / name
+    subprocess.run([str(script), *args], check=True)
+
+
 def direct(node: str, socket_ms: int = 5000) -> MongoClient:
     """Direct connection to one node by name (bypasses replica-set discovery)."""
     return MongoClient(

@@ -8,21 +8,21 @@ A laboratory study of MongoDB's causal consistency guarantees through controlled
 
 ### Cluster Topology
 
-We deployed MongoDB 7.0 as a five-node replica set (`rs0`) running in Docker containers. The nodes are mongo1, mongo2, mongo3, mongo4, and mongo5, configured with replica set priorities of 2, 0, 1, 0, and 0 respectively. This priority scheme designates mongo1 as the initial primary, mongo3 as the failover candidate with priority 1, and the remaining nodes as secondaries with no election eligibility. All containers run on the same Docker bridge network (`mongo-cluster`), with host-side access via published ports (27017–27021).
+We deployed MongoDB 7.0 as a five-node replica set (`rs0`) running in Docker containers. The nodes are mongo1, mongo2, mongo3, mongo4, and mongo5, configured with priorities of 2, 0, 1, 0, and 0 respectively. This setup makes mongo1 the main database server, mongo3 the backup (ready to take over if mongo1 fails), and the rest are replicas. All containers are on the same network and accessible on ports 27017–27021.
 
-The choice of five nodes with asymmetric priorities serves two purposes. First, it allows us to create a mathematically clean partition: isolating mongo1 and mongo2 leaves a three-node majority (mongo3, mongo4, mongo5) that can elect a new primary, while the two-node minority (mongo1, mongo2) cannot reach quorum. Second, the priority configuration makes election outcomes predictable: after partition, mongo3 wins the majority side deterministically because of its higher priority relative to mongo4 and mongo5. This predictability is essential for test reproducibility.
+The choice of five nodes with different priorities serves two purposes. First, it lets us create a clean network split: isolating mongo1 and mongo2 leaves a three-node group (mongo3, mongo4, mongo5) that can pick a new leader, while the two-node group (mongo1, mongo2) cannot. Second, the priority setup makes the outcome predictable: after the split, mongo3 always becomes leader of the three-node group because it has higher priority than mongo4 and mongo5. This predictability is important for repeatable tests.
 
 ### Infrastructure Functions
 
-**partition_minority()** isolates mongo1 and mongo2 from the rest of the cluster by executing a script that configures iptables rules on all five containers. These rules drop all TCP traffic between the two groups while preserving connectivity within each group. The effect is a complete network partition: the minority partition cannot reach the majority, and vice versa.
+**partition_minority()** isolates mongo1 and mongo2 from the rest of the cluster by configuring network rules on all five containers. These rules block all traffic between the two groups while keeping connections within each group working. The result is that the two-node group cannot reach the three-node group, and vice versa.
 
-**heal()** reverses the partition by flushing all iptables rules. When connectivity is restored, MongoDB detects the cluster is whole again and reconciles the two divergent histories. MongoDB always trusts the majority partition's history. Any writes acknowledged on the minority partition but never replicated to the majority are rolled back.
+**heal()** reverses the partition by flushing all network rules. When connectivity is restored, MongoDB reconciles the two divergent histories. MongoDB always trusts the three-node group's history. Any writes acknowledged by the two-node group but never replicated to the three-node group are discarded.
 
-**set_election_timeout(ms)** reconfigures the replica set's `electionTimeoutMillis` parameter, which controls how long a node waits before triggering an election when it cannot reach the current primary. This parameter directly affects the timing dynamics during a network partition, particularly the window between when mongo3 (majority side) becomes PRIMARY and when mongo1 (minority side) steps down.
+**set_election_timeout(ms)** controls how long a server waits before picking a new leader when it loses contact with the current leader. This timing directly affects how long the two-node group's leader (mongo1) stays in charge after the network split, before it steps down and mongo3 takes over on the three-node group.
 
-We measured election timing empirically at six different timeout values to understand this window. The pattern is clear: as the election timeout increases, the window widens significantly. The table below shows one representative measurement run:
+We tested how long this transition takes at different timeout values. The pattern is clear: higher timeouts mean longer transitions. Here's a typical measurement:
 
-| electionTimeoutMillis | mongo3 PRIMARY | mongo1 STEPDOWN | Window |
+| Timeout (ms) | mongo3 Leader | mongo1 Steps Down | Transition Time |
 |---|---|---|---|
 | 5000 | ~56s | ~56s | ~0s |
 | 10000 | ~15s | ~21s | ~6s |
@@ -31,96 +31,97 @@ We measured election timing empirically at six different timeout values to under
 | 60000 | ~68s | ~121s | ~53s |
 | 120000 | ~130s | ~241s | ~111s |
 
-(Note: These timings vary between runs depending on system load and container overhead. The values shown represent a typical run; actual measurements may differ by 5–15 seconds.)
+(Note: These times vary between runs. The values shown are typical; actual measurements may differ by 5–15 seconds.)
 
-For divergent-read tests, we need mongo1 to remain PRIMARY on the isolated minority long enough to issue a clock-advancing write after mongo3 becomes PRIMARY on the majority side. At lower timeouts (5,000–10,000 milliseconds), the window is essentially nonexistent or only a few seconds wide—too narrow to reliably perform the clock-advance operation. At 120,000 milliseconds, the window expands to roughly 100–120 seconds, providing ample time to issue the necessary write. The trade-off is that divergent-read tests run significantly longer (~240 seconds vs. ~60 seconds for rollback tests), but this extended timeout is empirically necessary to make the clock-skew mechanism observable without artificial injection.
+For certain tests, we need mongo1 to stay in charge long enough to do an extra write after mongo3 takes over on the three-node side. Lower timeouts (5–10 seconds) give us only a few seconds—often not enough. At 120 seconds, we get roughly 100 seconds—enough time. The trade-off is that these tests take much longer (~240 seconds vs. ~60 seconds), but this is necessary to make the mechanism work without artificial help.
 
-**wait_primary(node, timeout_seconds)** polls a node's `admin.command('hello')` response every 2 seconds, checking whether it reports itself as the writable primary. The function returns immediately once the node reports PRIMARY status. This ensures that timing-sensitive operations (such as writing W2 in a monotonic-writes test) occur on the actual elected primary, not on an arbitrary node.
+**wait_primary(node, timeout_seconds)** checks a node every 2 seconds to see if it has become the leader. The function returns as soon as the node reports that it is the leader. This ensures timing-sensitive operations (like writing data to the actual leader in a test) happen on the right node, not on an arbitrary one.
 
-**finalize_experiment(heal_wait_seconds)** performs cleanup after each test. It calls `heal()` to restore connectivity, sleeps for a configurable duration (default 12 seconds) to allow MongoDB's replication to complete, calls `set_election_timeout(5000)` to restore the fast election timeout, and calls `stabilize_after_test()` to poll until all nodes report a healthy state (either PRIMARY or SECONDARY). This sequence ensures every test starts with a known good cluster state.
+**finalize_experiment(heal_wait_seconds)** cleans up after each test. It restores the network connection, waits for MongoDB to finish copying data between servers, resets the timeout back to the faster setting, and checks that all servers are healthy and in normal operation. This ensures every test starts with a clean state.
 
-**stabilize_after_test()** polls all five nodes every 1 second, waiting until all report themselves as either PRIMARY or SECONDARY (not RECOVERING, not STARTUP).
+**stabilize_after_test()** checks all five servers every 1 second until they all report they are healthy and ready (either leader or replica, not recovering).
 
 ### Causal Consistency and Sessions
 
-All reads and writes in our tests occur in causally consistent MongoDB sessions created with `client.start_session(causal_consistency=True)`. A client session tracks both an operation time and a cluster time. MongoDB returns these logical times with acknowledged operations, and the driver advances the session's causal state accordingly. For subsequent reads in a causally consistent session, the driver automatically supplies an `afterClusterTime` constraint. A replica-set member servicing such a read must wait until its oplog has reached that time before returning the result, preserving the session's causal ordering.
+All tests use causally consistent MongoDB sessions. A session tracks two pieces of timing information: operation time and cluster time. When MongoDB acknowledges a write, it includes these times, and the session remembers them. On later reads in the same session, the session tells MongoDB: "wait until your data has reached at least this point in time before returning results." This keeps the session's reads and writes ordered correctly.
 
-Our tests also transfer causal state between sessions to simulate a client carrying causal history across connections. Before issuing an operation from another session context, we advance its `operation_time` and `cluster_time` from the previous session. With a single session, the driver normally preserves this state automatically; the test manually transfers it to model a reconnection scenario.
+Our tests also pass session timing information from one connection to another to simulate a client reconnecting. Normally the driver preserves this automatically; we manually transfer it to model the reconnection scenario.
 
-Full durable causal-consistency guarantees require `readConcern: "majority"` and `writeConcern: "majority"`. Other read concern and write concern combinations provide weaker guarantees, particularly under network partitions and rollback scenarios. We deliberately test combinations like `local/w:1` and `majority/w:1` to expose the boundaries where weaker guarantees permit violations.
+Full causal consistency requires using `readConcern: "majority"` (reads wait for majority-replicated data) and `writeConcern: "majority"` (writes wait for majority acknowledgment). Other combinations like `local/w:1` provide weaker guarantees, especially during network splits and server failures. We deliberately test weaker combinations to show where consistency breaks down.
+
+### What "Violation" Means in These Experiments
+
+[TBA]
 
 ### Collections and Data Schema
 
-Each of the four consistency models uses its own collection (`ryw`, `mr`, `mw`, `wfr`). Documents are simple: `{"k": unique_key_id, "v": 0}` for most tests, with model-specific fields as needed (e.g., `"saw": value` for WFR). We use single-key documents to keep test logic simple and failure modes unambiguous. Real workloads operate on thousands or millions of keys; our tests demonstrate that each consistency violation **can** occur, not how frequently it occurs in practice.
+Each consistency model uses its own collection (`ryw`, `mr`, `mw`, `wfr`). Documents are simple: `{"k": key_id, "v": 0}` for most tests, with extra fields added as needed (e.g., `"saw": value` for WFR tests). We use single documents to keep test logic clear. Real systems store millions of documents; our tests show that each consistency problem **can** happen, not how often it happens in practice.
 
 ---
 
 ## II. Read-Your-Writes (RYOW)
 
-**Definition:** Read-your-writes consistency guarantees that after a session writes a value, any later read in that session must return that value or a newer one—never an older or absent state.
+**Definition:** Read-your-writes consistency means: after a session writes a value, any later read in that session must see that value or something newer—never an older value.
 
 ### Expected Outcomes
 
 | Configuration | Expected Verdict | Mechanism |
 |---|---|---|
-| majority/majority | SAFE | Write refused on isolated minority |
-| majority/w:1 | VIOLATED | Write rolls back on heal |
-| local/w:1 | VIOLATED | Write rolls back on heal |
-| local/majority | VIOLATED | Local read returns stale data |
+| majority/majority | NOT_VIOLATED | Write blocked on two-node group |
+| majority/w:1 | VIOLATED | Write discarded on heal |
+| local/w:1 | VIOLATED | Write discarded on heal |
+| local/majority | VIOLATED | Read sees stale data |
 
 ### Procedure A: Rollback Mechanism (majority/w:1, local/w:1)
 
-**What we are simulating:** We simulate the scenario where a write is acknowledged locally to a client on an isolated primary but has not yet reached a quorum. When the partition heals, the majority partition's committed history wins, and the write is discarded. This exposes applications that assume all acknowledged writes persist.
+**What we are simulating:** A write is acknowledged to the client on mongo1 (in the two-node group) but never reaches the three-node group. When the network heals, the three-node group's history wins, and the write is discarded.
 
-We begin by writing a baseline value (X=0) with w:majority to mongo1. This write requires acknowledgment from a majority of nodes (three out of five), so it is durable and will survive the partition. The baseline is essential because it allows us to later verify that the write-under-test rolled back: if the final read returns X=0, we know X=1 was discarded.
+**Steps:**
+1. Write baseline: x=0 on mongo1 with write concern "majority" (acknowledged by the three-node group, so it survives).
+2. Split the network: isolate mongo1 and mongo2.
+3. Write x=1 on mongo1 with write concern "w:1" (acknowledged by mongo1 alone, won't reach the three-node group).
+4. Read x on mongo1 (sees x=1; the write is there).
+5. Heal the network: restore connectivity.
+6. Read x again (sees x=0; the three-node group's history won, discarding x=1).
 
-Next, we partition the cluster. The partition isolates mongo1 and mongo2 from mongo3, mongo4, and mongo5. At this point, mongo3 (with priority 1) becomes the primary of the majority side. We then open a causal consistency session on mongo1 (the isolated old primary) and write X=1 with the test's write concern. If write concern is w:1, this write is acknowledged immediately after reaching just mongo1 (one node), even though the other four nodes have no knowledge of it. If write concern is w:majority, the write cannot complete because mongo1 can only reach itself and mongo2 (two nodes), which is not a majority. The session then reads X=1 back immediately, confirming it was acknowledged.
-
-We wait approximately 15 seconds (or more precisely, we use `wait_primary()` to detect when mongo3 becomes primary) to ensure the majority side has completed its election. During this time, mongo1's operational lifespan on the isolated minority is limited—after 15 seconds or so, it realizes it cannot reach a quorum and steps down.
-
-Finally, we heal the partition by flushing the iptables rules. MongoDB detects connectivity is restored and immediately recognizes that three nodes (mongo3, mongo4, mongo5) form a quorum and that the canonical history is on the majority side. Mongo1 and mongo2 re-sync to this history. Any write acknowledged on mongo1 but not replicated to the majority—namely, X=1—is discarded. A final read of X from any surviving node will return X=0 (the baseline), confirming that X=1 rolled back.
-
-**Reasoning:** The 15-second wait is calibrated to the default election timeout of 5,000 milliseconds. MongoDB will not step down a primary immediately upon discovering it has lost quorum; instead, it waits up to the election timeout to avoid thrashing during transient network glitches. At 5 seconds, the election timeout expires. Mongo1 may then step down, and mongo3 (already elected on the majority side) is now uncontested as the sole primary. We use 15 seconds to provide a buffer and to ensure that even if the election timing varies, mongo3 has become primary before we heal.
-
-**Results and Interpretation:**
-
-For the majority/majority configuration: The write is refused on the isolated minority because mongo1 cannot reach three nodes (including itself, it can only reach two). The client receives an error, the write is never acknowledged, and there is no rollback—simply a refusal to acknowledge an unsafe write. The verdict is SAFE because RYOW is satisfied: no acknowledged write is lost.
-
-For the majority/w:1 configuration: The write is acknowledged on mongo1 (w:1 means write to 1 node), and the session reads it back. Upon heal, the write rolls back because it never reached the majority. The session observes X=1 in step 3 but X=0 in step 6, violating RYOW. The verdict is VIOLATED.
-
-For the local/w:1 configuration: Identical to majority/w:1. The readConcern (local vs. majority) does not affect rollback behavior; only the writeConcern determines whether the write persists. The verdict is VIOLATED.
+**Reasoning:** The session wrote x=1 and read it back. After healing, the three-node group's history is trusted, and x=1 is discarded. The same session reads x=0, a regression from x=1 to x=0. This violates read-your-writes.
 
 ### Procedure B: Divergent-Read Mechanism (local/majority)
 
-**What we are simulating:** We simulate a scenario where a local read gates on the node's logical clock (clusterTime) rather than on the actual presence of data. If the clock advances past the causal token's timestamp, the read proceeds without waiting for the data to arrive, returning a stale value. This exposes applications that rely on local reads for consistency.
+**What we are simulating:** A session reads a majority-committed x=1 from the three-node group, then reads the same key from the isolated two-node group. The second read returns x=0, an older value, because mongo2's clock was pushed past the write's timestamp even though the write itself never replicated there.
 
-We begin by raising the election timeout to 120,000 milliseconds. We write a baseline value (X=0) with w:majority, then partition the cluster. We wait for mongo3 to become the primary of the majority partition (using `wait_primary()`).
+**Steps:**
+1. Write baseline: x=0 on mongo1 with write concern "majority".
+2. Split the network: isolate mongo1 and mongo2.
+3. Wait for mongo3 to become leader of the three-node group.
+4. Write x=1 on mongo3 with write concern "majority" and capture the session's timing (operation_time, cluster_time).
+5. Write a dummy value on mongo1 with write concern "w:1". Mongo2 receives it and its clock advances past the x=1 timestamp; wait until the dummy replicates to mongo2 (otherwise the trial is inconclusive).
+6. Read x on mongo2 (two-node group) with read concern "local", replaying the captured timing: sees x=0 (local read concern returns once the clock is past the captured time, even though the data is not there).
+7. Heal the network.
 
-Next, we write X=1 to mongo3 with w:majority. Mongo3 is the primary of the majority partition, so this write is acknowledged and durable. We capture the causal tokens from this write: the operation_time (T1) and cluster_time. These tokens represent the logical point in the operation stream where X=1 was written.
+**Reasoning:** The session's timing says "data from point T exists." Mongo2's clock advances past T without receiving the data. A local read checks only the clock, not whether the data arrived, and returns old data. This violates read-your-writes. (This is the same divergent-read mechanism used for monotonic reads in §III.)
 
-Mongo2 (a secondary on the isolated minority) does not have X=1 because it is partitioned from mongo3. However, MongoDB's logical clock is separate from data replication. The clock ticks forward on every write, whether or not the write replicates. We now write a dummy value to mongo1 (the isolated primary) with w:1. This write has a timestamp after T1 and replicates to mongo2. When mongo2 receives this write, its local clock (clusterTime) advances past T1, even though it never received X=1.
+### Verdicts
 
-We then read X on mongo2 using a causal session. We manually advance the session's tokens to T1 to model a client that connected to mongo3 earlier and captured T1, then reconnected to mongo2. A local read checks whether clusterTime ≥ afterClusterTime (the causal token's time). Since mongo2's clock is now past T1, the read proceeds immediately without waiting for data and returns X=0—the baseline. This is a stale read: we know X=1 exists on mongo3, but the local read returned X=0.
+Before running, we fix three possible outcomes for each trial and the exact condition that triggers each:
 
-As a control, we run the same test with readConcern:majority. A majority read waits for the write to be majority-committed. Since mongo2 is on the isolated minority and cannot reach mongo3, the read blocks indefinitely and times out, returning UNAVAILABLE. The majority read correctly refused to return stale data.
+- **VIOLATED** — a later read returns an older value than the session already wrote or read (a regression). This is the outcome we are trying to provoke.
+- **NOT_VIOLATED** — the read returns the written value or newer, or the write is refused / the read blocks instead of serving stale data. The property was not broken on this run.
+- **INCONCLUSIVE** — the trial never set up the history it was meant to test (the doomed write failed to ack, mongo3 was not elected in time, or the clock-advance write never reached mongo2). Not a result about the property — a failed run.
 
-Finally, we heal the partition and restore the election timeout to 5,000 milliseconds.
+### Results
 
-**Reasoning:** We use a 120-second election timeout so mongo1 stays primary on the minority partition long enough to issue the dummy write. At 5 seconds, mongo1 would step down before we could advance the clock. The dummy write to mongo1 is necessary because we need mongo2's clock to advance; writing to mongo2 directly would not trigger replication. By writing to mongo1 (the primary) with w:1, the write replicates to mongo2, and mongo2's clock advances.
+All four configurations matched their expected verdicts.
 
-The test transfers causal state between sessions to model a client carrying causal history across connections. With a single session, the driver normally preserves this state automatically; the test manually transfers it to a separate session.
+For majority/w:1 and local/w:1 (rollback): the w:1 write acks on mongo1 but is thrown away on heal, so the session's earlier read no longer holds. VIOLATED.
 
-**Results and Interpretation:**
+For local/majority (divergent-read): the local read on mongo2 returns the stale x=0. VIOLATED.
 
-For the local/majority configuration with local read: The read on mongo2 returns X=0 (stale). The session observed X=1 in step 4 (via the causal tokens and the write to mongo3) and X=0 in step 7 (via the stale local read on mongo2), violating RYOW. The verdict is VIOLATED.
-
-For the local/majority configuration with majority read (control): The read blocks on mongo2 and times out. No stale data is returned; the read is UNAVAILABLE. The verdict is SAFE because we never return a stale value, and RYOW is upheld (though the session cannot read at all).
+For majority/majority: the write can't ack on the two-node side in the first place, so there's nothing to regress from. NOT_VIOLATED. (Control: a majority read on mongo2 blocks instead of returning stale data, also NOT_VIOLATED.)
 
 ### Limitations
 
-The divergent-read test's success depends on timing: mongo3 must be elected before mongo1 steps down, and the dummy write must propagate to mongo2 before the partition heals. At a 120-second election timeout, this timing window is wide enough (~140–175 seconds) that the test succeeds reliably. However, no guarantee exists that the window will remain adequate in all environments or that clock skew will manifest in every run. Occasional runs may see mongo1 step down early or mongo3 take longer than expected to be elected, resulting in INCONCLUSIVE verdicts. We mitigate this by using `wait_primary()` to actively detect when mongo3 is primary, rather than hardcoding a sleep duration.
-
-Additionally, our tests use single keys and single sessions. Real workloads distribute operations across thousands of keys and many concurrent sessions. These tests demonstrate that each consistency violation **can** occur under specific conditions, not that it occurs frequently in practice.
+The rollback trials depend on the doomed write acking on the two-node side before heal. The divergent-read trial depends on the 120-second election-timeout window keeping mongo1 leader long enough; occasional runs see mongo1 step down early, giving an inconclusive verdict.
 
 ---
 
@@ -132,12 +133,48 @@ Additionally, our tests use single keys and single sessions. Real workloads dist
 
 | Configuration | Expected Verdict | Mechanism |
 |---|---|---|
-| majority/majority | HELD | Both writes refused or both survive |
-| majority/w:1 | VIOLATED | X rolls back while Y survives |
-| local/w:1 | VIOLATED | X rolls back while Y survives |
-| local/majority | VIOLATED | Local read returns stale data after majority write |
+| majority/majority | NOT_VIOLATED | Read 2 times out; no older value seen |
+| majority/w:1 | NOT_VIOLATED | Read 2 times out; no older value seen |
+| local/w:1 | VIOLATED | Read 2 returns stale data |
+| local/majority | VIOLATED | Read 2 returns stale data |
 
-[TODO: Procedure A and B sections, following RYOW structure]
+### Procedure
+
+**What we are simulating:** A session reads x=1 on the three-node group's new leader, then reads the same key from the isolated two-node group. What gates the second read is the **read** concern (the first half of the config), not the write concern. Under a majority read the second read can't reach the three-node group, so it blocks and times out. Under a local read it returns the stale x=0, because mongo2's clock was pushed past the write's timestamp even though the write never replicated there.
+
+**Steps:**
+1. Raise the election timeout to 120 seconds so mongo1 stays leader on the two-node side long enough for the trial (confirm the setting took, else inconclusive).
+2. Write baseline: x=0 on mongo1 with write concern "majority"; wait until it replicates to mongo2 (else inconclusive).
+3. Split the network: isolate mongo1 and mongo2.
+4. Wait for mongo3 to become leader of the three-node group.
+5. Write x=1 on mongo3 with the tested write concern; read it back with the tested read concern (Read 1, sees x=1) and capture the session's timing (operation_time, cluster_time; else inconclusive).
+6. Write a dummy value on mongo1 with write concern "w:1"; wait until it replicates to mongo2, advancing mongo2's clock past the x=1 timestamp (else inconclusive).
+7. On mongo2, open a fresh session, replay the captured timing, and read x with the tested read concern (Read 2).
+8. Heal the network.
+
+**Reasoning:** Read 1 fixes what the session has seen: x=1. The question is whether Read 2 can hand back anything older. A local read on mongo2 will, because it only checks whether the clock has passed the timestamp, and we advanced the clock without shipping the data, so it returns x=0. A majority read won't, because it can't confirm the value against the three-node group and blocks instead. Read 2 returning x=0 after Read 1 saw x=1 is the regression that breaks monotonic reads.
+
+### Verdicts
+
+Before running, we fix three possible outcomes for each trial and the exact condition that triggers each:
+
+- **VIOLATED** — Read 2 returns x=0 after Read 1 returned x=1 (a regression). This is the outcome we are trying to provoke.
+- **NOT_VIOLATED** — Read 2 returns x=1, or times out instead of serving stale data. The property was not broken on this run. (The `detail` field records which of the two happened.)
+- **INCONCLUSIVE** — the trial never reached the final read: the baseline did not replicate, mongo3 was not elected, the clock-advance write never reached mongo2, or the election timeout was not applied. Not a result about the property — a failed run.
+
+### Results
+
+All four configurations matched their expected verdicts.
+
+For majority/majority and majority/w:1: Read 2 times out on mongo2, since a majority read can't reach the three-node group, so no stale value comes back. NOT_VIOLATED.
+
+For local/w:1: Read 2 gates on mongo2's advanced clock and returns the stale x=0, a regression from x=1. VIOLATED.
+
+For local/majority: Read 2 uses a local read (the read concern, not the write concern, governs it) and returns the stale x=0 on mongo2, a regression from x=1. VIOLATED.
+
+### Limitations
+
+Simple rollback tests depend on Y acking on the majority partition; if timeout or election delays occur, Y may not reach majority before healing and the test becomes inconclusive. Divergent-read tests depend on the 120-second election timeout window; occasional runs may see mongo1 step down early, resulting in inconclusive verdicts.
 
 ---
 
@@ -149,35 +186,101 @@ Additionally, our tests use single keys and single sessions. Real workloads dist
 
 | Configuration | Expected Verdict | Mechanism |
 |---|---|---|
-| majority/majority | SAFE | W1 refused on isolated minority |
+| majority/majority | NOT_VIOLATED | W1 refused on minority partition |
 | majority/w:1 | VIOLATED | W1 rolls back while W2 survives |
 | local/w:1 | VIOLATED | W1 rolls back while W2 survives |
-| local/majority | SAFE | W1 refused on isolated minority |
+| local/majority | NOT_VIOLATED | W1 refused on minority partition |
 
-[TODO: Procedure section, following RYOW structure]
+### Procedure: Rollback Mechanism (all configurations)
+
+**What we are simulating:** A session issues W1 then W2. W1 is acknowledged on the isolated two-node group but never reaches the three-node group, and W2 is issued afterward on the three-node group's new leader, carrying W1's causal timestamps. When the network heals, the three-node group's history wins: W1 is thrown away while W2 stays. The surviving state has the later write but not the earlier one it followed.
+
+**Steps:**
+1. Write baseline: k1=0 and k2=0 on mongo1 with write concern "majority".
+2. Split the network: isolate mongo1 and mongo2.
+3. Write W1 (k1=1) on mongo1 with the tested write concern, in a causally consistent session; capture that session's timing (operation_time, cluster_time).
+4. Wait for mongo3 to become leader of the three-node group.
+5. Write W2 (k2=1) on mongo3 with the tested write concern, in a new session that replays W1's captured timing.
+6. Heal the network and wait for convergence.
+7. Read k1 and k2 with a fixed majority read concern (regardless of the config under test).
+
+**Reasoning:** Under a w:1 write concern, W1 acks on mongo1 even though only the two-node side has it, and W2 acks on mongo3 and stays. After heal, k1 rolls back to 0 while k2 stays 1: the final state holds W2 without the W1 it followed, which is exactly what monotonic writes forbids. Under a w:majority write concern, W1 can't reach a majority from the two-node side, so it's refused and never acked. With no acknowledged W1 there's no ordering to break. We fix the diagnostic read at majority so the verdict reflects the recovered durable state rather than whatever the tested read concern happens to expose. If W1 acks but mongo3 is never elected, or the write session hands back no timestamp, we mark the run INCONCLUSIVE instead of issuing a W2 that isn't coupled to W1.
+
+### Verdicts
+
+Before running, we fix three possible outcomes for each trial and the exact condition that triggers each:
+
+- **VIOLATED** — W1 was acknowledged, W2 survived, and W1 rolled back, so the final state holds W2 but not W1. This is the outcome we are trying to provoke.
+- **NOT_VIOLATED** — both writes survive, or W1 could not be acknowledged so no violating ordering could form. The property was not broken on this run.
+- **INCONCLUSIVE** — W1 acked but mongo3 was not elected, or the write session produced no causal timestamp. Not a result about the property — a failed run.
+
+### Results
+
+All four configurations matched their expected verdicts.
+
+For majority/w:1 and local/w:1: W1 acks, then rolls back on heal while W2 stays. VIOLATED.
+
+For majority/majority and local/majority: W1 is refused on the minority side, so no ordering can form. NOT_VIOLATED.
+
+### Limitations
+
+The test depends on W2 reaching the majority partition before healing. Election delays or timeout issues may prevent W2 from acking, resulting in inconclusive verdicts.
 
 ---
 
 ## V. Writes-Follow-Reads (WFR)
 
-**Definition:** Writes-follow-reads consistency guarantees that if a session reads a value and then writes, the write is causally ordered after the read. Every server holding the write must also hold the value that was read.
+**Definition:** Writes-follow-reads consistency guarantees that a write issued after reading a value is ordered after that value. If a session reads X and writes Y, every server holding Y must also hold X.
 
 ### Expected Outcomes
 
 | Configuration | Expected Verdict | Mechanism |
 |---|---|---|
-| majority/majority | SAFE | Session read blocked; no dependent write issued |
-| majority/w:1 | SAFE | Session read blocked; no dependent write issued |
+| majority/majority | NOT_VIOLATED | Majority read sees committed k1=0 (or blocks); no dependent write |
+| majority/w:1 | NOT_VIOLATED | Majority read sees committed k1=0 (or blocks); no dependent write |
 | local/w:1 | VIOLATED | Session reads doomed value; dependent write survives rollback |
 | local/majority | VIOLATED | Session reads doomed value; dependent write survives rollback |
 
-[TODO: Procedure section, following RYOW structure]
+### Procedure: Doomed-Read Mechanism (all configurations)
+
+**What we are simulating:** A separate client writes k1=1 (call it W1) on the isolated two-node group with w:1, so it acks locally but is doomed to roll back. Our session then reads k1, sees that doomed 1, and issues a dependent write W2 on the three-node group's new leader, carrying the read session's causal timestamps. When the network heals, W1 (k1=1) is thrown away but W2 stays. That leaves a write standing on a read of a value no server keeps.
+
+**Steps:**
+1. Write baseline: k1=0 and k2=0 on mongo1 with write concern "majority".
+2. Split the network: isolate mongo1 and mongo2.
+3. Write W1 (k1=1) on mongo1 with write concern "w:1" (doomed). If this does not ack, the doomed precondition was never established, so the run is inconclusive.
+4. In a causally consistent session, read k1 with the tested read concern and capture the session's timing (operation_time, cluster_time).
+5. If the read observed k1=1 (only possible with a local read), wait for mongo3 to become leader and write W2 (k2=1, recording "saw k1=1") on mongo3 with the tested write concern, in a new session that replays the read's captured timing.
+6. Heal the network.
+7. Read k1 and k2 with majority read concern to check whether W2 survived while k1 rolled back.
+
+**Reasoning:** Under a local read, the session sees the doomed k1=1 and writes W2 on mongo3 carrying that read's timestamps. After heal, k1 rolls back to 0 but W2 stays, so a dependent write outlives the value it was based on, which breaks writes-follow-reads. Under a majority read, k1=1 was never majority committed, so the read can't see it: it either returns the committed k1=0 or blocks. With no k1=1 observed, the session never issues a dependent write and there's nothing to violate. Note the difference between two cases that both leave the session without a k1=1 to act on: a majority read that legitimately doesn't see it is a real negative control, but a doomed W1 that never acked in the first place means we failed to set up the trial, so that run is INCONCLUSIVE. Same for a read that hands back no timestamp, or a mongo3 that isn't elected in time.
+
+### Verdicts
+
+Before running, we fix three possible outcomes for each trial and the exact condition that triggers each:
+
+- **VIOLATED** — the session read the doomed k1=1, W2 was written, and on heal k1 rolled back while W2 survived, so a dependent write outlived the read it followed. This is the outcome we are trying to provoke.
+- **NOT_VIOLATED** — the read did not observe k1=1 (it returned the committed k1=0 or blocked), so no dependent write was issued. The property was not broken on this run.
+- **INCONCLUSIVE** — the doomed W1 never acked (precondition not established), the read produced no causal timestamp, or mongo3 was not elected in time. Not a result about the property — a failed run.
+
+### Results
+
+All four configurations matched their expected verdicts.
+
+For local/w:1 and local/majority: the local read sees the doomed k1=1, W2 acks on mongo3, and after heal k1=0 while k2=1. VIOLATED.
+
+For majority/majority and majority/w:1: the majority read returns k1=0 or blocks, so no dependent write is issued. NOT_VIOLATED.
+
+### Limitations
+
+The test depends on W2 acking on mongo3 before healing. If election delays prevent mongo3 from becoming primary quickly, W2 may not be issued or may not reach the majority before healing, resulting in inconclusive verdicts.
 
 ---
 
-## VI. Conclusions
+## VI. References
 
-[TODO: Summary of findings, agreement with MongoDB documentation, final observations]
+[TODO]
 
 ---
 
