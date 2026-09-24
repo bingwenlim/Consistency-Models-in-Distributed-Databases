@@ -103,8 +103,9 @@ def simple_rollback(write_concern, config_label: str) -> None:
     finally:
         p.close()
 
-    print(f"==> waiting {SIMPLE_STEPDOWN_WAIT}s for the majority side to elect {FAILOVER}", flush=True)
-    time.sleep(SIMPLE_STEPDOWN_WAIT)
+    print(f"==> waiting up to {SIMPLE_STEPDOWN_WAIT}s for {FAILOVER} to become primary", flush=True)
+    if not wait_primary(FAILOVER, SIMPLE_STEPDOWN_WAIT):
+        print(f"==> {FAILOVER} was not elected in time; Y write will fail", flush=True)
     print_state("during partition")
 
     # Y=2 write on majority primary (w:majority, survives). Capture causal tokens.

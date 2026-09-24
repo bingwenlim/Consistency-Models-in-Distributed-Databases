@@ -63,6 +63,7 @@ def set_election_timeout(ms: int) -> None:
     """Set electionTimeoutMillis via one rs.reconfig. Tries each node so whoever
     is primary accepts it. Priority is left at baseline -- raising it does NOT
     speed elections (the full electionTimeoutMillis elapses before any vote).
+    Default is 5000ms for fast elections; divergent-read tests override to 120000ms.
     """
     js = f"const c=rs.conf(); c.settings.electionTimeoutMillis={ms}; rs.reconfig(c);"
     for node in NODES:
