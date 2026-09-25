@@ -36,12 +36,13 @@ def pre_flight_check(timeout_seconds: int = 30) -> None:
                 if not is_primary:
                     raise ClusterNotReady("mongo1 is not PRIMARY")
 
+                status = c1.admin.command("replSetGetStatus")
+
             with direct("mongo3") as c3:
                 is_secondary = not c3.admin.command("hello").get("isWritablePrimary", False)
                 if not is_secondary:
                     raise ClusterNotReady("mongo3 is not SECONDARY")
 
-            status = c1.admin.command("replSetStatus")
             healthy = all(m.get("state") in (1, 2) for m in status["members"])
             if not healthy:
                 raise ClusterNotReady("Some members are not SECONDARY or PRIMARY")
@@ -64,7 +65,7 @@ def stabilize_after_test(timeout_seconds: int = 30) -> None:
         try:
             for node in NODES:
                 with direct(node, socket_ms=2000) as c:
-                    status = c.admin.command("replSetStatus")
+                    status = c.admin.command("replSetGetStatus")
                     if status["ok"]:
                         members_ok = all(m.get("state") in (1, 2) for m in status["members"])
                         if members_ok:
