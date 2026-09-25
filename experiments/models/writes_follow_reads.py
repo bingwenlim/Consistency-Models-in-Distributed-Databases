@@ -33,7 +33,7 @@ from pymongo.write_concern import WriteConcern
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lib import (  # noqa: E402
     DB, NODES, OLD_PRIMARY, FAILOVER, MINORITY,
-    direct, partition_minority, print_state, wait_primary,
+    direct, partition_minority, print_state, set_election_timeout, wait_primary,
 )
 from helpers import finalize_experiment
 
@@ -44,7 +44,7 @@ CONFIGS = {
     "local/majority": ("local", "majority"),
 }
 
-FAILOVER_WAIT = 40
+FAILOVER_WAIT = 60
 READ_TIMEOUT_MS = 5000
 
 
@@ -61,6 +61,9 @@ def writes_follow_reads(read_concern: str, write_concern, config_label: str) -> 
     healed = False
 
     try:
+        set_election_timeout(30000)
+        time.sleep(2)
+
         p = direct(OLD_PRIMARY)
         base = p[DB].get_collection("wfr", write_concern=WriteConcern(w="majority"))
         base.insert_one({"k": k1, "v": 0})
