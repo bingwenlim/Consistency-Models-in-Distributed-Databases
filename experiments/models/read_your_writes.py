@@ -47,7 +47,6 @@ CONFIGS = {
     "local/majority": ("local", "majority"),
 }
 
-ROLLBACK_STEPDOWN_WAIT = 15
 DIVERGENT_ELECTION_TIMEOUT_MS = 120000
 DIVERGENT_PRIMARY_WAIT = 175
 
@@ -80,6 +79,9 @@ def rollback(write_concern, config_label: str) -> str:
     healed = False
 
     try:
+        set_election_timeout(30000)
+        time.sleep(2)
+
         p = direct(OLD_PRIMARY)
         p[DB].get_collection("ryw", write_concern=WriteConcern(w="majority")).insert_one(
             {"k": key, "v": 0}
@@ -107,8 +109,9 @@ def rollback(write_concern, config_label: str) -> str:
         finally:
             p.close()
 
-        print(f"==> waiting {ROLLBACK_STEPDOWN_WAIT}s for majority to elect {FAILOVER}", flush=True)
-        time.sleep(ROLLBACK_STEPDOWN_WAIT)
+        print(f"==> waiting for {FAILOVER} to become PRIMARY", flush=True)
+        if not wait_primary(FAILOVER, 60):
+            raise Inconclusive(f"{FAILOVER} was not elected within the timeout")
         print_state("during partition")
 
         # Heal before the verdict read: the VIOLATED case depends on the doomed
