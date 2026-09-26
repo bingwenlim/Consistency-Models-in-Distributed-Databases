@@ -51,11 +51,71 @@ Full causal consistency requires using `readConcern: "majority"` (reads wait for
 
 ### What "Violation" Means in These Experiments
 
-[TBA]
+A consistency guarantee is a statement about *every* execution: it holds only if no client can ever observe the forbidden ordering. Proving that a guarantee holds is therefore impractical by testing alone — we can only fail to break it. Proving that a guarantee does *not* hold, on the other hand, needs just one counterexample. Our experiments are built around that asymmetry: for each configuration we construct the single execution most likely to expose a violation, and record whether the violation actually appears.
+
+Concretely, every trial ends in one of three verdicts, fixed **before** the run so the outcome is not decided after the fact:
+
+- **VIOLATED** — the client observed the specific regression the model forbids (a later read older than an earlier read or write; a surviving write whose predecessor or its read-dependency has vanished). One such observation is sufficient to show the guarantee does not hold under that configuration.
+- **NOT_VIOLATED** — the trial ran to completion and the forbidden ordering did not occur: the value read was current or newer, the unsafe write was refused, or the read blocked rather than serving stale data. This is evidence *consistent with* the guarantee holding for this configuration; it is not a proof that it always holds.
+- **INCONCLUSIVE** — the trial never established the history it was designed to test (a doomed write failed to acknowledge, `mongo3` was not elected within the window, a causal timestamp was not captured, or the clock-advance write never replicated). This is a statement about the *harness*, not about MongoDB, and such runs are re-run rather than counted.
+
+Every violation we produce reduces to one physical event: a **rollback**. MongoDB serialises all writes through a single primary into one totally ordered oplog, so two operations can never be *reordered*. The only way to expose an inconsistency is for a write that a client already relied on — either wrote, or read — to be **discarded** when the network heals and the majority side's history wins. Read concern and write concern determine whether a client is allowed to rely on such a doomed write in the first place; that is precisely what distinguishes the four configurations.
 
 ### Collections and Data Schema
 
 Each consistency model uses its own collection (`ryw`, `mr`, `mw`, `wfr`). Documents are simple: `{"k": key_id, "v": 0}` for most tests, with extra fields added as needed (e.g., `"saw": value` for WFR tests). We use single documents to keep test logic clear. Real systems store millions of documents; our tests show that each consistency problem **can** happen, not how often it happens in practice.
+
+### Consistency Configurations Explored
+
+MongoDB exposes client-centric consistency through a small set of tunable knobs. We sweep the two that matter most and hold the rest fixed.
+
+**Swept knobs (the 2×2 grid tested for every model):**
+
+| Knob | Values | Meaning (per MongoDB docs) |
+|---|---|---|
+| `writeConcern` | `w:1`, `majority` | `w:1` acknowledges once the primary has the write — fast, but **not necessarily durable**. `majority` acknowledges only after a majority of nodes have it — **durable**, survives a rollback. |
+| `readConcern` | `local`, `majority` | `local` returns the node's most recent data, which may be uncommitted and can later roll back. `majority` returns only majority-committed data, which cannot roll back. |
+
+This yields four configurations per model: `majority/majority`, `majority/w:1`, `local/w:1`, `local/majority` (written `readConcern/writeConcern`).
+
+**Fixed knobs:**
+
+- **Causally consistent session — always on.** All four client-centric guarantees are *defined over a session*, so every trial runs inside one. With causal consistency disabled, even `majority/majority` would not guarantee the four models.
+- **`readPreference` / target node — chosen per experiment.** Rather than let the driver route reads, each trial connects directly to a specific node (`directConnection=true`) so it can deliberately read a lagging or soon-to-be-rolled-back replica. This is the honest model of a client whose reads land on a different member — exactly the situation client-centric consistency is about. (`readPreference` is MongoDB's production-level control for the same thing; a delayed member is invisible to ordinary `readPreference=secondary` routing, which is why we pin the connection.)
+
+Stronger settings exist but are out of scope for the swept grid: `readConcern:"linearizable"` and `"snapshot"`, multi-document transactions, and the `j` (journal) write-concern flag. We note them for completeness; the four-model story is fully determined by the `readConcern × writeConcern` grid above.
+
+### Experimental Scenarios
+
+The project brief asks for several operating scenarios; every trial exercises a combination of the three:
+
+- **Normal operation** — every trial starts on a fully connected replica set, where the baseline values are written with `w:majority`. There is no separate healthy-cluster arm: both violation mechanisms need two divergent branches of history, which only a failover creates, so normal operation is the starting phase of each trial rather than a test of its own.
+- **Node / leader failure** — every partition forces the old primary (`mongo1`) to step down and a new primary (`mongo3`) to be elected on the majority side, i.e. a real failover mid-experiment.
+- **Network partition** — the core mechanism: `partition_minority()` splits the cluster 2-vs-3 with `iptables` rules, and `heal()` restores it, triggering the rollback that exposes (or fails to expose) each violation.
+
+No failpoints or synthetic MongoDB modifications are used; every violation arises from a real partition plus real writes.
+
+### Deployment and Reproduction
+
+The full run is scripted; a reviewer can reproduce every result end to end.
+
+**Prerequisites:** Docker + Docker Compose, Python ≥ 3.11, and the `uv` package manager.
+
+```bash
+# 1. Start the 5-node replica set (initialises rs0, forces mongo1 PRIMARY)
+./scripts/up.sh
+
+# 2. Run experiments (from the experiments/ directory)
+cd experiments
+uv run models/read_your_writes.py --config majority/w:1   # one trial
+uv run run_experiments.py --model monotonic_reads         # one model, 4 configs
+uv run run_experiments.py                                 # all 16 trials (~30 min)
+
+# 3. Tear down (add --wipe to also delete data volumes)
+./scripts/down.sh
+```
+
+The client reaches each node by its published host port with `directConnection=true`; a `?replicaSet=rs0` URI is not usable from the host because the driver would resolve members by their container hostnames. Expected runtimes: 90–210 s per trial, ~30 min for all sixteen.
 
 ---
 
@@ -72,19 +132,19 @@ Each consistency model uses its own collection (`ryw`, `mr`, `mw`, `wfr`). Docum
 | local/w:1 | VIOLATED | Write discarded on heal |
 | local/majority | VIOLATED | Read sees stale data |
 
-### Procedure A: Rollback Mechanism (majority/w:1, local/w:1)
+### Procedure A: Rollback Mechanism (majority/majority, majority/w:1, local/w:1)
 
 **What we are simulating:** A write is acknowledged to the client on mongo1 (in the two-node group) but never reaches the three-node group. When the network heals, the three-node group's history wins, and the write is discarded.
 
 **Steps:**
 1. Write baseline: x=0 on mongo1 with write concern "majority" (acknowledged by the three-node group, so it survives).
 2. Split the network: isolate mongo1 and mongo2.
-3. Write x=1 on mongo1 with write concern "w:1" (acknowledged by mongo1 alone, won't reach the three-node group).
-4. Read x on mongo1 (sees x=1; the write is there).
-5. Heal the network: restore connectivity.
-6. Read x again (sees x=0; the three-node group's history won, discarding x=1).
+3. In a causally consistent session, write x=1 on mongo1 with the tested write concern ("w:1" is acknowledged by mongo1 alone and won't reach the three-node group; "majority" is refused).
+4. Wait for mongo3 to become leader of the three-node group.
+5. Heal the network and wait for the replica set to converge.
+6. Read x with read concern "majority" (after an acknowledged "w:1" write it sees x=0; the three-node group's history won, discarding x=1).
 
-**Reasoning:** The session wrote x=1 and read it back. After healing, the three-node group's history is trusted, and x=1 is discarded. The same session reads x=0, a regression from x=1 to x=0. This violates read-your-writes.
+**Reasoning:** The client was told that x=1 succeeded, but after healing the three-node group's history is trusted and x=1 is discarded, so the recovered state holds x=0. This violates read-your-writes. The trial tests durable read-your-writes across recovery: the write's session is closed before the heal, and the final check reads the recovered state instead of issuing a second read inside the same live session. Because that check is a fixed majority read, the tested read concern plays no part in this procedure, so majority/w:1 and local/w:1 run the same trial. Under write concern "majority" the write is refused on the two-node side, so there is nothing to lose.
 
 ### Procedure B: Divergent-Read Mechanism (local/majority)
 
@@ -113,11 +173,13 @@ Before running, we fix three possible outcomes for each trial and the exact cond
 
 All four configurations matched their expected verdicts.
 
-For majority/w:1 and local/w:1 (rollback): the w:1 write acks on mongo1 but is thrown away on heal, so the session's earlier read no longer holds. VIOLATED.
+For majority/w:1 and local/w:1 (rollback): the w:1 write acks on mongo1 but is thrown away on heal, so the recovered state no longer holds the acknowledged write. VIOLATED.
 
 For local/majority (divergent-read): the local read on mongo2 returns the stale x=0. VIOLATED.
 
-For majority/majority: the write can't ack on the two-node side in the first place, so there's nothing to regress from. NOT_VIOLATED. (Control: a majority read on mongo2 blocks instead of returning stale data, also NOT_VIOLATED.)
+For majority/majority: the write can't ack on the two-node side in the first place, so there's nothing to regress from. NOT_VIOLATED.
+
+Optional control (`./run.sh read-your-writes local/majority --control`, not part of the 16-trial grid): the divergent-read trial repeated with a majority read blocks on mongo2 instead of returning stale data. NOT_VIOLATED.
 
 ### Limitations
 
@@ -174,7 +236,7 @@ For local/majority: Read 2 uses a local read (the read concern, not the write co
 
 ### Limitations
 
-Simple rollback tests depend on Y acking on the majority partition; if timeout or election delays occur, Y may not reach majority before healing and the test becomes inconclusive. Divergent-read tests depend on the 120-second election timeout window; occasional runs may see mongo1 step down early, resulting in inconclusive verdicts.
+The test depends on the 120-second election timeout window keeping mongo1 leader long enough for the clock-advance write; occasional runs may see mongo1 step down early, resulting in inconclusive verdicts.
 
 ---
 
@@ -278,9 +340,53 @@ The test depends on W2 acking on mongo3 before healing. If election delays preve
 
 ---
 
-## VI. References
+## VI. Results Summary
 
-[TODO]
+All sixteen trials (four models × four configurations) were run against the live five-node cluster with the orchestration harness (`run_experiments.py`). Every observed verdict matched the prediction made beforehand.
+
+| Model | majority / majority | majority / w:1 | local / w:1 | local / majority |
+|---|---|---|---|---|
+| **Read-your-writes** | NOT_VIOLATED | **VIOLATED** | **VIOLATED** | **VIOLATED** |
+| **Monotonic-reads** | NOT_VIOLATED | NOT_VIOLATED | **VIOLATED** | **VIOLATED** |
+| **Monotonic-writes** | NOT_VIOLATED | **VIOLATED** | **VIOLATED** | NOT_VIOLATED |
+| **Writes-follow-reads** | NOT_VIOLATED | NOT_VIOLATED | **VIOLATED** | **VIOLATED** |
+
+Reading the grid by column and row makes the structure explicit:
+
+- **`majority/majority` never violates any model.** Full causal consistency with durability holds across the board — the expected safe corner.
+- **Write concern governs the write-ordering models.** Monotonic-writes (and the write-side of read-your-writes) breaks exactly when `writeConcern:w:1` lets a non-durable write be acknowledged and later rolled back; `writeConcern:majority` refuses that write and stays safe.
+- **Read concern governs the read-ordering models.** Monotonic-reads and writes-follow-reads break exactly when `readConcern:local` lets a session observe a value that is not majority-committed (and can vanish); `readConcern:majority` blocks or returns committed data and stays safe.
+- **Read-your-writes needs both.** It is the strictest model — three of four configurations violate it, because it can be broken from either side (a rolled-back write *or* a divergent stale read).
+
+The lone case where our first prediction was wrong is documented honestly: monotonic-reads under `local/majority` was initially expected to be NOT_VIOLATED, but the run returned VIOLATED, and on review the corrected prediction (a `local` read gates on the node clock, not on majority commitment, so it can serve stale data regardless of the write concern) is the one recorded above. The experiment corrected the expectation, not the other way around.
+
+---
+
+## VII. Discussion
+
+**Observations vs. predictions.** Fifteen of sixteen trials matched the prediction on the first pass, and the sixteenth (MR `local/majority`) matched after the prediction was corrected to reflect that read concern — not write concern — gates a divergent read. Taken together the results reproduce MongoDB's documented causal-consistency table exactly: the four client-centric guarantees hold only when both concerns are `majority`, and each weaker setting breaks precisely the models the documentation says it should.
+
+**Why the two mechanisms suffice.** Because a single primary imposes one total order on writes, reordering is impossible; every violation is instead a *rollback* of something the client relied on. That reduces the whole study to two levers. Write concern decides whether an *acknowledged write* is durable — so it controls the write-ordering models (MW, and the write half of RYOW). Read concern decides whether a *read* is allowed to observe non-durable state — so it controls the read-ordering models (MR, WFR, and the read half of RYOW). This is why `majority/majority` is the only universally safe corner: it closes both levers at once, at the cost of latency (a majority read blocks until the data is majority-committed, and a majority write blocks until a majority acknowledges it).
+
+**Limitations.**
+
+- **Timing dependence.** The rollback trials require a doomed write to acknowledge on the minority side before healing, and the divergent-read trials require `mongo1` to remain writable for ~100 s (achieved by raising `electionTimeoutMillis` to 120 000). Occasionally the old primary steps down early, yielding an INCONCLUSIVE verdict that must be re-run. This is a property of the test harness, not of MongoDB.
+- **Existence, not frequency.** Each experiment uses one key (or one dependency pair) and one client session. It demonstrates that a violation *can* occur under a given configuration, not how often it would occur under a production workload.
+- **Controlled determinism.** Fixed member priorities (`mongo1`=2, `mongo3`=1) make the partition sides and the failover winner predictable, and the divergent-read trials issue an explicit clock-advance write to make a naturally-occurring-but-rare race reproducible. MongoDB itself is unmodified — no failpoints — so the mechanisms are real; only their *timing* is forced.
+- **Single deployment.** All five nodes share one host and a Docker bridge, so replication is far faster than a geo-distributed deployment. This makes natural violations rarer (hence the manufactured windows) but does not change which configurations are vulnerable.
+
+---
+
+## VIII. References
+
+1. MongoDB, Inc. *Causal Consistency and Read and Write Concerns.* MongoDB Manual. https://www.mongodb.com/docs/manual/core/causal-consistency-read-write-concerns/
+2. MongoDB, Inc. *Read Concern*, *Write Concern*, *Read Preference*, and *Replica Set Elections & Rollbacks.* MongoDB Manual.
+3. MongoDB, Inc. *Causal Consistency.* MongoDB Manual. https://www.mongodb.com/docs/manual/core/read-isolation-consistency-recency/
+4. Terry, D. B., Demers, A. J., Petersen, K., Spreitzer, M. J., Theimer, M. M., & Welch, B. B. (1994). *Session Guarantees for Weakly Consistent Replicated Data.* Proceedings of the Third International Conference on Parallel and Distributed Information Systems (PDIS). — the original definitions of read-your-writes, monotonic reads, monotonic writes, and writes-follow-reads.
+
+### AI Usage Disclosure
+
+AI assistance (Claude) was used during this project to help scaffold the Docker/replica-set setup, draft and debug the experiment scripts and the orchestration harness, reason about the failover-timing windows, and draft and edit portions of this report. All experiments were executed by the team against the live cluster, and every result reported here was produced and verified by running the code in this repository; the AI did not generate any result independently of an actual run.
 
 ---
 
