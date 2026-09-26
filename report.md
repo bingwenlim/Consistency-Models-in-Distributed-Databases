@@ -89,7 +89,7 @@ Stronger settings exist but are out of scope for the swept grid: `readConcern:"l
 
 The project brief asks for several operating scenarios; every trial exercises a combination of the three:
 
-- **Normal operation** — the baseline write in each experiment (and the healthy-cluster control arms) runs against a fully connected replica set.
+- **Normal operation** — every trial starts on a fully connected replica set, where the baseline values are written with `w:majority`. There is no separate healthy-cluster arm: both violation mechanisms need two divergent branches of history, which only a failover creates, so normal operation is the starting phase of each trial rather than a test of its own.
 - **Node / leader failure** — every partition forces the old primary (`mongo1`) to step down and a new primary (`mongo3`) to be elected on the majority side, i.e. a real failover mid-experiment.
 - **Network partition** — the core mechanism: `partition_minority()` splits the cluster 2-vs-3 with `iptables` rules, and `heal()` restores it, triggering the rollback that exposes (or fails to expose) each violation.
 
@@ -132,19 +132,19 @@ The client reaches each node by its published host port with `directConnection=t
 | local/w:1 | VIOLATED | Write discarded on heal |
 | local/majority | VIOLATED | Read sees stale data |
 
-### Procedure A: Rollback Mechanism (majority/w:1, local/w:1)
+### Procedure A: Rollback Mechanism (majority/majority, majority/w:1, local/w:1)
 
 **What we are simulating:** A write is acknowledged to the client on mongo1 (in the two-node group) but never reaches the three-node group. When the network heals, the three-node group's history wins, and the write is discarded.
 
 **Steps:**
 1. Write baseline: x=0 on mongo1 with write concern "majority" (acknowledged by the three-node group, so it survives).
 2. Split the network: isolate mongo1 and mongo2.
-3. Write x=1 on mongo1 with write concern "w:1" (acknowledged by mongo1 alone, won't reach the three-node group).
-4. Read x on mongo1 (sees x=1; the write is there).
-5. Heal the network: restore connectivity.
-6. Read x again (sees x=0; the three-node group's history won, discarding x=1).
+3. In a causally consistent session, write x=1 on mongo1 with the tested write concern ("w:1" is acknowledged by mongo1 alone and won't reach the three-node group; "majority" is refused).
+4. Wait for mongo3 to become leader of the three-node group.
+5. Heal the network and wait for the replica set to converge.
+6. Read x with read concern "majority" (after an acknowledged "w:1" write it sees x=0; the three-node group's history won, discarding x=1).
 
-**Reasoning:** The session wrote x=1 and read it back. After healing, the three-node group's history is trusted, and x=1 is discarded. The same session reads x=0, a regression from x=1 to x=0. This violates read-your-writes.
+**Reasoning:** The client was told that x=1 succeeded, but after healing the three-node group's history is trusted and x=1 is discarded, so the recovered state holds x=0. This violates read-your-writes. The trial tests durable read-your-writes across recovery: the write's session is closed before the heal, and the final check reads the recovered state instead of issuing a second read inside the same live session. Because that check is a fixed majority read, the tested read concern plays no part in this procedure, so majority/w:1 and local/w:1 run the same trial. Under write concern "majority" the write is refused on the two-node side, so there is nothing to lose.
 
 ### Procedure B: Divergent-Read Mechanism (local/majority)
 
@@ -173,11 +173,13 @@ Before running, we fix three possible outcomes for each trial and the exact cond
 
 All four configurations matched their expected verdicts.
 
-For majority/w:1 and local/w:1 (rollback): the w:1 write acks on mongo1 but is thrown away on heal, so the session's earlier read no longer holds. VIOLATED.
+For majority/w:1 and local/w:1 (rollback): the w:1 write acks on mongo1 but is thrown away on heal, so the recovered state no longer holds the acknowledged write. VIOLATED.
 
 For local/majority (divergent-read): the local read on mongo2 returns the stale x=0. VIOLATED.
 
-For majority/majority: the write can't ack on the two-node side in the first place, so there's nothing to regress from. NOT_VIOLATED. (Control: a majority read on mongo2 blocks instead of returning stale data, also NOT_VIOLATED.)
+For majority/majority: the write can't ack on the two-node side in the first place, so there's nothing to regress from. NOT_VIOLATED.
+
+Optional control (`./run.sh read-your-writes local/majority --control`, not part of the 16-trial grid): the divergent-read trial repeated with a majority read blocks on mongo2 instead of returning stale data. NOT_VIOLATED.
 
 ### Limitations
 
@@ -234,7 +236,7 @@ For local/majority: Read 2 uses a local read (the read concern, not the write co
 
 ### Limitations
 
-Simple rollback tests depend on Y acking on the majority partition; if timeout or election delays occur, Y may not reach majority before healing and the test becomes inconclusive. Divergent-read tests depend on the 120-second election timeout window; occasional runs may see mongo1 step down early, resulting in inconclusive verdicts.
+The test depends on the 120-second election timeout window keeping mongo1 leader long enough for the clock-advance write; occasional runs may see mongo1 step down early, resulting in inconclusive verdicts.
 
 ---
 
