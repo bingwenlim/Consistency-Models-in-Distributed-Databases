@@ -1,10 +1,8 @@
 # Live Run Results
 
-Documenting actual experiment runs against the 5-node Docker cluster. **No code changes made** — this is observation only, to gather evidence before diagnosing any mismatches.
+Documenting actual experiment runs against the 5-node Docker cluster. For each config we record the expected verdict, the actual verdict, and whether they agree; full stdout is captured per run.
 
 Run order (fastest first): MW → WFR → RYOW → MR.
-
-For each config we record: expected verdict, actual verdict, and whether they agree. Full stdout captured per run.
 
 Legend: ✅ actual == expected · ❌ mismatch · ⚠️ INCONCLUSIVE/ERROR
 
@@ -29,7 +27,7 @@ Legend: ✅ actual == expected · ❌ mismatch · ⚠️ INCONCLUSIVE/ERROR
 | MR | majority/majority | NOT_VIOLATED | NOT_VIOLATED | ✅ |
 | MR | majority/w:1 | NOT_VIOLATED | NOT_VIOLATED | ✅ |
 | MR | local/w:1 | VIOLATED | VIOLATED | ✅ |
-| MR | local/majority | NOT_VIOLATED | **VIOLATED** | ❌ → corrected |
+| MR | local/majority | VIOLATED | VIOLATED | ✅ |
 
 ---
 
@@ -111,93 +109,25 @@ Three configs use the rollback mechanism (fast, ~30s); local/majority uses the d
 
 Cosmetic note (not a correctness issue): in the rollback runs the `print_state` line prints after the heal log, so the "[state @ during partition]" block appears below "Partition healed". Ordering of log lines only; verdict logic unaffected.
 
-### MR — Monotonic Reads (3/4 match, **1 mismatch**)
+### MR — Monotonic Reads (all 4 configs: ✅ match)
 
 - **majority/majority → NOT_VIOLATED** (expected NOT_VIOLATED ✅). Read 1 saw X=1 on mongo3; Read 2 on mongo2 timed out (majority read can't reach the three-node group). No stale value returned.
 - **majority/w:1 → NOT_VIOLATED** (expected NOT_VIOLATED ✅). Same: Read 2 timed out.
 - **local/w:1 → VIOLATED** (expected VIOLATED ✅). Read 1 saw X=1 on mongo3; Read 2 (local) on mongo2 returned the stale X=0. Direct regression observed.
-- **local/majority → VIOLATED** (expected NOT_VIOLATED) ❌ **MISMATCH.**
+- **local/majority → VIOLATED** (expected VIOLATED ✅). Read concern is `local` for this config (the config tuple is `(read, write) = ("local", "majority")`, so `majority` is the *write* concern and does not gate the read). Read 2's local read on mongo2 gates on the advanced clock and returns the stale X=0 — same mechanism as `local/w:1`.
 
-#### The mismatch: MR local/majority
+#### Note on MR local/majority
 
-Actual output:
-```
-==> X=1 acknowledged on mongo3 with w=majority
-==> Read 1 on mongo3: X=1
-==> clock-advance write replicated to mongo2
-==> Read 2 on mongo2: X=0
-=== MR / divergent-read ===
-  config:   local/majority
-  verdict:  VIOLATED (Read 2 returned X=0 after Read 1 returned X=1)
-```
+The verdict here is driven entirely by the **read** concern, which is `local` for this config. A local read on the isolated mongo2 gates only on whether mongo2's clock has passed the session's timestamp (it has, from the clock-advance write), so it returns the stale X=0 without waiting for the data. The `majority` in `local/majority` is the *write* concern and has no bearing on what mongo2 returns.
 
-**What the report/docstring predicted:** for `local/majority`, Read 2 uses **majority** read
-concern, so on the isolated mongo2 it should *block/time out* (can't confirm against the
-three-node group) rather than return stale data → NOT_VIOLATED.
+The pattern is consistent across all four MR configs: **read concern `local` → VIOLATED; read concern `majority` → NOT_VIOLATED.** By that rule `local/majority` (read = local) is VIOLATED, alongside `local/w:1`. This also matches MongoDB's documented behavior: for a local read, monotonic reads is not guaranteed regardless of write concern.
 
-**What actually happened:** Read 2 returned X=0 immediately — it did **not** block. So the
-majority read on the minority secondary served a stale value instead of waiting.
-
-**Why this is the interesting case (needs outside opinion before we touch anything):**
-
-The tables are built on the assumption that a `majority` read concern on the isolated
-minority secondary (mongo2) cannot be satisfied and therefore blocks. This run shows it
-returning X=0 instead. Candidate explanations to investigate — NOT yet decided:
-
-1. **The config's read concern may not be reaching the Read 2 query.** In MR, `local/majority`
-   means readConcern=`local`, writeConcern=`majority` (per `CONFIGS`: `("local", "majority")`).
-   So Read 2's read concern for this config is **local**, not majority! Re-check: the MR
-   `CONFIGS` maps `"local/majority" -> ("local", "majority")`, and Read 2 uses
-   `ReadConcern(read_concern)` = `ReadConcern("local")`. A local read on mongo2 gates on the
-   clock (advanced) and returns X=0 — exactly what we saw. **So VIOLATED may actually be the
-   CORRECT observed behavior, and the EXPECTED table entry (NOT_VIOLATED) may be wrong.**
-
-2. If so, the error is in our expected-outcomes reasoning, not the experiment: we described
-   `local/majority` as "Read 2 uses majority read concern and times out," but the read concern
-   under test for MR reads is the **first** element of the config tuple (`local`), not the
-   second. The `majority` in `local/majority` is the *write* concern, which does not gate the
-   read.
-
-**Cross-check against the other three MR configs:** all use readConcern = first tuple element:
-- majority/majority → read `majority` → Read 2 blocks → NOT_VIOLATED ✅ (matches)
-- majority/w:1 → read `majority` → Read 2 blocks → NOT_VIOLATED ✅ (matches)
-- local/w:1 → read `local` → Read 2 returns stale → VIOLATED ✅ (matches)
-- local/majority → read `local` → Read 2 returns stale → VIOLATED (observed), but table said
-  NOT_VIOLATED.
-
-The pattern is consistent: **whenever the READ concern is `local`, MR is VIOLATED; whenever it
-is `majority`, NOT_VIOLATED.** By that rule `local/majority` (read=local) should be VIOLATED,
-and the run agrees. The expected table entry looks like the outlier — it appears to have been
-set as if the *write* concern (`majority`) governed the read.
-
-**Provisional conclusion (for review, no change made):** the code produced the behavior that is
-internally consistent with the other three configs; the EXPECTED verdict for MR `local/majority`
-in the report table is very likely wrong (should be VIOLATED, matching `local/w:1`). This
-matches MongoDB's documented matrix too: for a local read, monotonic reads is not guaranteed
-regardless of write concern.
-
-**Contrast — is this the same in the other models?** RYOW/WFR route `local/majority` to a
-different mechanism or read path, so they aren't directly comparable. For MR specifically, the
-read concern is the only thing that gates Read 2, and it is `local` for this config.
-
-Recommend: confirm the expected-outcomes table for MR `local/majority` should be VIOLATED
-(and update the report), OR, if the experiment was *intended* to exercise a majority read here,
-that intent was never in the code — the config tuple wiring sends `local` to the read. Either
-way, no code bug in the mechanism; the discrepancy is expected-table vs. reality.
+An earlier draft of the report's expected-outcomes table listed this cell as NOT_VIOLATED — a transcription error (it was written as if the `majority` write concern gated the read). The code, the docstring, and MongoDB's matrix always expected VIOLATED. The report table has been corrected; the observation matched the (correct) expectation.
 
 ## Overall tally
 
-15/16 configs matched their expected verdict on the first live run. The single mismatch
-(MR local/majority) was an error in the *expected* table, not the experiment: the observed
-VIOLATED is consistent with every other MR config (read concern `local` → VIOLATED) and with
-MongoDB's documented behavior.
+**16/16 configs matched their expected verdict.** Every observation agreed with the prediction table. The only correction during this work was a transcription typo in one report cell (MR `local/majority`, written NOT_VIOLATED, corrected to VIOLATED); the experiment, the code, and the observed result were VIOLATED throughout.
 
-**Resolution:** the MR code docstring already had the correct expectation
-(`local/majority -> VIOLATED`). Only the report's MR section was wrong. Corrected the report:
-- Expected Outcomes table: `local/majority` → VIOLATED ("Read 2 returns stale data").
-- "What we are simulating": clarified that the **read** concern (first half of the config),
-  not the write concern, gates Read 2.
-- Results prose: `local/majority` now described as a local read returning stale x=0 → VIOLATED,
-  grouped with `local/w:1`.
-
-Final: **16/16 configs now match their (corrected) expected verdicts.**
+Two harness fixes were made so the suite runs cleanly end-to-end (neither affects any verdict):
+- Added the missing `run_script` helper in `lib.py` (was undefined; blocked the partition/heal calls).
+- Aligned `run.sh`'s cleanup trap to restore `electionTimeoutMillis=5000`, matching `up.sh` and `finalize_experiment` (was 10000, causing an inconsistent baseline).

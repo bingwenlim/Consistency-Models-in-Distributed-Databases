@@ -10,7 +10,7 @@
 #     --control  (local/majority only) run the majority-read control -> UNAVAILABLE
 #
 # Ensures mongo1 is PRIMARY first, then runs the model. ALWAYS heals the partition
-# and restores electionTimeoutMillis=10000 on exit (even on failure / Ctrl-C).
+# and restores electionTimeoutMillis=5000 on exit (even on failure / Ctrl-C).
 #
 # Each model has a script in experiments/models/.
 set -euo pipefail
@@ -21,9 +21,9 @@ MODEL="${1:?Usage: run.sh <model> <config> [--control]}"
 shift
 
 restore() {
-  echo "==> [cleanup] healing partition + restoring electionTimeoutMillis=10000"
+  echo "==> [cleanup] healing partition + restoring electionTimeoutMillis=5000"
   "$SCRIPTS/heal-split.sh" >/dev/null 2>&1 || true
-  local js='const c=rs.conf();c.settings.electionTimeoutMillis=10000;rs.reconfig(c);'
+  local js='const c=rs.conf();c.settings.electionTimeoutMillis=5000;rs.reconfig(c);'
   for n in mongo1 mongo2 mongo3 mongo4 mongo5; do
     docker exec "$n" mongosh --quiet --eval "$js" >/dev/null 2>&1 && break || true
   done
